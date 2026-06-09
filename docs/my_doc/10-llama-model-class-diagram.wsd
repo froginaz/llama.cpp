@@ -1,0 +1,273 @@
+@startuml
+title src/llama-model.h — class diagram
+
+skinparam classAttributeIconSize 0
+skinparam linetype ortho
+skinparam classBackgroundColor #FDFDFD
+skinparam classBorderColor #555555
+hide circle
+
+' ============================================================
+'  Enums
+' ============================================================
+enum llm_type {
+  LLM_TYPE_UNKNOWN
+  LLM_TYPE_14M
+  LLM_TYPE_270M
+  LLM_TYPE_7B
+  LLM_TYPE_8x7B
+  LLM_TYPE_405B
+  LLM_TYPE_671B
+  LLM_TYPE_E4B
+  .. ~130 size / MoE variants ..
+}
+
+' ============================================================
+'  Central model class (abstract)
+' ============================================================
+abstract class llama_model {
+  -- identity --
+  +type : llm_type
+  +arch : llm_arch
+  +name : std::string
+  +classifier_labels : vector<string>
+  -- hyperparams / vocab --
+  +hparams : llama_hparams
+  +vocab : llama_vocab
+  -- top-level weights --
+  +tok_embd : ggml_tensor*
+  +type_embd : ggml_tensor*
+  +pos_embd : ggml_tensor*
+  +output_norm : ggml_tensor*
+  +output : ggml_tensor*
+  +cls / cls_out / conv1d : ggml_tensor*
+  +altup_proj / per_layer_* : ggml_tensor*
+  +dense_2_out_layers ... : ggml_tensor*
+  -- containers --
+  +layers : vector<llama_layer>
+  +devices : vector<llama_device>
+  +gguf_kv : unordered_map<string,string>
+  +tensors_by_name : vector<pair<string,ggml_tensor*>>
+  +loras : unordered_set<llama_adapter_lora*>
+  +get_split_state_ud : ..._userdata
+  +t_load_us / t_start_us : int64_t
+  -- lifecycle --
+  +llama_model(params : llama_model_params&)
+  +~llama_model() <<virtual>>
+  -- queries --
+  +arch_name() : string
+  +type_name() : string
+  +desc() : string
+  +size() : size_t
+  +n_tensors() / n_devices() : size_t
+  +n_elements() : uint64_t
+  +n_gpu_layers() : uint32_t
+  +split_mode() : llama_split_mode
+  +memory_breakdown() : map<buft,size_t>
+  +get_tensor(name) : const ggml_tensor*
+  +dev_layer(il) / dev_output() : ggml_backend_dev_t
+  +select_buft(il) : ggml_backend_buffer_type_t
+  +get_rope_freq_base/scale(cparams, il) : float
+  +get_rope_factors(cparams, il) : ggml_tensor*
+  -- factory / graph --
+  +create_memory(params, cparams) : llama_memory_i*
+  +build_graph(params : llm_graph_params&) : ggml_cgraph*
+  -- pure virtual (subclass must define) --
+  +{abstract} load_stats(ml)
+  +{abstract} load_hparams(ml)
+  +{abstract} load_vocab(ml)
+  +{abstract} load_tensors(ml) : bool
+  +{abstract} load_arch_hparams(ml)
+  +{abstract} load_arch_tensors(ml)
+  +{abstract} build_arch_graph(params) : unique_ptr<llm_graph_context>
+  -- internal --
+  #params : llama_model_params
+  #pimpl : unique_ptr<impl>
+}
+
+class "impl" as model_impl <<pimpl / opaque>> {
+}
+
+' ============================================================
+'  Base every concrete model inherits from (abstract)
+' ============================================================
+abstract class llama_model_base {
+  +model : llama_model*
+  +ml : llama_model_loader*
+  +tn : const LLM_TN
+  +TENSOR_DUPLICATED : const int
+  +TENSOR_NOT_REQUIRED : const int
+  +TENSOR_SKIP : const int
+  +TENSOR_SKIP_IF_VIRTUAL : const int
+  --
+  +llama_model_base(params)
+  +create_tensor(ml, tn, ne, flags) : ggml_tensor*
+  +create_tensor(tn, ne, flags) : ggml_tensor*
+  +create_tensor_gate_up_exps(layer, bid, ...)
+  +create_tensor_qkv(layer, bid, ...)
+  +load_stats(ml) <<override>>
+  +load_hparams(ml) <<override>>
+  +load_vocab(ml) <<override>>
+  +load_tensors(ml) : bool <<override>>
+  +{abstract} load_arch_hparams(ml)
+  +{abstract} load_arch_tensors(ml)
+  +{abstract} build_arch_graph(params)
+}
+
+note bottom of llama_model_base
+  Concrete per-architecture models
+  (llama_model_llama, llama_model_qwen3, ...)
+  live in src/models/*.cpp and inherit
+  llama_model_base, implementing the
+  three abstract load_arch_* / build_arch_graph.
+end note
+
+' ============================================================
+'  Per-layer weights
+' ============================================================
+class llama_layer {
+  .. normalization (~21) ..
+  +attn_norm, attn_q_norm, attn_k_norm : ggml_tensor*
+  +attn_post_norm, ssm_norm, ssm_dt_norm ... : ggml_tensor*
+  .. attention (~22) ..
+  +wq, wk, wv, wo, wqkv : ggml_tensor*
+  +wq_a, wq_b, wkv_a_mqa, wkv_b : ggml_tensor*
+  +wq_cross/enc ..., wqkv_gate : ggml_tensor*
+  .. feed-forward (~6) ..
+  +ffn_gate, ffn_down, ffn_up : ggml_tensor*
+  .. MoE experts (~20) ..
+  +ffn_gate_inp, ffn_gate_exps : ggml_tensor*
+  +ffn_down_exps, ffn_up_exps : ggml_tensor*
+  +ffn_*_shexp, ffn_*_chexps : ggml_tensor*
+  .. Mamba / SSM (~25) ..
+  +ssm_in, ssm_x, ssm_dt, ssm_out : ggml_tensor*
+  +ssm_conv1d, ssm_a, ssm_d : ggml_tensor*
+  +ssm_q/k/v_conv, ssm_beta ... (Kimi KDA) : ggml_tensor*
+  .. RWKV time/channel mix (~45) ..
+  +time_mix_w1/w2/lerp_*/decay_* : ggml_tensor*
+  +channel_mix_key/value/receptance : ggml_tensor*
+  .. scales / rope / altup / misc ..
+  +rope_long, rope_short, rope_freqs : ggml_tensor*
+  +wq_s ... ffn_*_s (bitnet/NVFP4 scales) : ggml_tensor*
+  +*_in_s (input scales) : ggml_tensor*
+  +altup_*, laurel_*, attn_sinks : ggml_tensor*
+  +visexp_* (cogvlm), ffn_act_* (xIELU) : ggml_tensor*
+  +indexer_* (DSA), out_scale : ggml_tensor*
+  __ sub-blocks __
+  +posnet : llama_layer_posnet
+  +convnext : llama_layer_convnext
+  +shortconv : llama_layer_shortconv
+  +nextn : llama_layer_nextn
+}
+
+note right of llama_layer
+  ~200 ggml_tensor* weight slots,
+  grouped here by feature.
+  Most are nullptr for any given
+  architecture (only the relevant
+  ones are populated at load time).
+end note
+
+class llama_layer_posnet {
+  +norm1/norm2, conv1/conv2 : ggml_tensor*
+  +attn_norm, attn_q/k/v/o (+_b) : ggml_tensor*
+  +norm (+_b) : ggml_tensor*
+}
+
+class llama_layer_convnext {
+  +dw (+_b) : ggml_tensor*
+  +norm (+_b) : ggml_tensor*
+  +pw1 (+_b), pw2 (+_b) : ggml_tensor*
+  +gamma : ggml_tensor*
+}
+
+class llama_layer_shortconv {
+  +in_proj : ggml_tensor*
+  +conv : ggml_tensor*
+  +out_proj : ggml_tensor*
+}
+
+class llama_layer_nextn {
+  +eh_proj (+_s,+_in_s) : ggml_tensor*
+  +embed_tokens : ggml_tensor*
+  +enorm, hnorm : ggml_tensor*
+  +shared_head_head (+_s,+_in_s) : ggml_tensor*
+  +shared_head_norm : ggml_tensor*
+}
+
+' ============================================================
+'  Devices
+' ============================================================
+class llama_device {
+  +is_meta : bool
+  +dev : ggml_backend_dev_t
+}
+
+class llama_meta_device_get_split_state_userdata {
+  +n_devices : size_t
+  +model : const llama_model*
+}
+
+' ============================================================
+'  External / collaborating types (defined elsewhere)
+' ============================================================
+class llama_hparams <<external>>
+class llama_vocab <<external>>
+class ggml_tensor <<external>>
+class llama_model_loader <<external>>
+class llama_model_params <<external>>
+class LLM_TN <<external>>
+class llm_graph_context <<external>>
+class ggml_cgraph <<external>>
+class llama_memory_i <<external>>
+class llama_adapter_lora <<external>>
+
+' ============================================================
+'  Relationships
+' ============================================================
+llama_model_base --|> llama_model
+
+llama_model "1" *-- "0..*" llama_layer : layers
+llama_model "1" *-- "0..*" llama_device : devices
+llama_model "1" *-- "1" llama_hparams : hparams
+llama_model "1" *-- "1" llama_vocab : vocab
+llama_model "1" *-- "1" llama_meta_device_get_split_state_userdata : get_split_state_ud
+llama_model "1" *-- "1" model_impl : pimpl
+llama_model "1" o-- "1" llama_model_params : params
+llama_model o-- "0..*" llama_adapter_lora : loras
+llama_model ..> ggml_cgraph : build_graph()
+llama_model ..> llm_graph_context : build_arch_graph()
+llama_model ..> llama_memory_i : create_memory()
+llama_model ..> llama_model_loader : load_*(ml)
+
+llama_layer *-- llama_layer_posnet : posnet
+llama_layer *-- llama_layer_convnext : convnext
+llama_layer *-- llama_layer_shortconv : shortconv
+llama_layer *-- llama_layer_nextn : nextn
+llama_layer o-- "0..*" ggml_tensor : weights
+
+llama_layer_posnet o-- ggml_tensor
+llama_layer_convnext o-- ggml_tensor
+llama_layer_shortconv o-- ggml_tensor
+llama_layer_nextn o-- ggml_tensor
+
+llama_device o-- ggml_backend_dev_t : dev
+llama_meta_device_get_split_state_userdata ..> llama_model : model
+
+llama_model_base o-- LLM_TN : tn
+llama_model_base ..> llama_model_loader : create_tensor()
+llama_model_base ..> llama_layer : create_tensor_qkv()
+
+llama_model ..> llm_type
+llama_model ..> llama_model_params : <<ctor>>
+
+note as Factories
+  Free factory functions (not members):
+    llama_model_create(arch, params)
+    llama_model_create(ml, params)
+    llm_type_name(type)
+    llama_internal_get_tensor_map(model)
+end note
+Factories .. llama_model
+
+@enduml
