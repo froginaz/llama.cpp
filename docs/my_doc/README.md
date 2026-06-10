@@ -145,6 +145,12 @@ Walking the stages in execution order:
 - Care only about the math/ops layer? Read [05-ggml-cgraph.md](05-ggml-cgraph.md) and [04-graph-construction.md](04-graph-construction.md).
 - Wondering how one graph runs on NVIDIA/Apple/AMD/Qualcomm/Huawei hardware? See [08-hardware-divergence.md](08-hardware-divergence.md).
 
+### Appendix diagrams & cross-runtime notes
+
+- [09-sequence-gguf-to-cgraph.wsd](09-sequence-gguf-to-cgraph.wsd) — PlantUML sequence: GGUF + per-arch C++ ⇒ `ggml_cgraph`.
+- [10-llama-model-class-diagram.wsd](10-llama-model-class-diagram.wsd) — PlantUML class diagram of `src/llama-model.h`.
+- [11-hw-backend-abstraction.md](11-hw-backend-abstraction.md) — abstracting one HW accelerator across **llama.cpp / ggml, ONNX Runtime, and ExecuTorch** backend APIs (entry points, comparison, a common `hwaccel.h`).
+
 ---
 
 ## Key takeaways
