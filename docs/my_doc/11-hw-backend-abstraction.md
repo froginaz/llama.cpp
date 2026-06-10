@@ -249,29 +249,67 @@ Two non-negotiable design constraints, driven directly by the three runtimes:
 
 ```plantuml
 @startuml
-title Three adapters over one hwaccel core
+title Three runtime adapters call into ONE shared hwaccel core
 skinparam componentStyle rectangle
+skinparam packageStyle rectangle
+left to right direction
 
-package "ggml adapter" {
-  [graph_compute] --> [hwa_compile (cache by graph hash)]
-  [graph_compute] --> [hwa_execute]
-  [supports_op] --> [hwa_supports]
-  [buffer vtables] --> [hwa_alloc / h2d / d2h]
+' ===== the single shared core — defined ONCE =====
+package "hwaccel core (your HW stack)" #E8F5E9 {
+  [hwa_supports]          as SUP
+  [hwa_compile]           as CMP
+  [hwa_load]              as LOAD
+  [hwa_execute]           as EXEC
+  [hwa_free]              as FREE
+  [hwa_alloc / h2d / d2h] as MEM
 }
-package "ONNX Runtime adapter (plugin EP)" {
-  [OrtEp::GetCapability] --> [hwa_supports]
-  [OrtEp::Compile] --> [hwa_compile]
-  [OrtNodeComputeInfo::CreateState] --> [hwa_load]
-  [OrtNodeComputeInfo::Compute] --> [hwa_execute]
-  [CreateAllocator/DataTransfer] --> [hwa_alloc / h2d / d2h]
+
+' ===== adapter 1: ggml (execute-only, no AOT) =====
+package "ggml adapter" #E3F2FD {
+  [device_i.supports_op]     as G_SUP
+  [backend_i.graph_compute]  as G_EXEC
+  [buffer-type / buffer]     as G_MEM
 }
-package "ExecuTorch adapter" {
-  [Partitioner.partition] --> [hwa_supports]
-  [BackendDetails.preprocess] --> [hwa_compile]
-  [BackendInterface::init] --> [hwa_load]
-  [BackendInterface::execute] --> [hwa_execute]
-  [BackendInterface::destroy] --> [hwa_free]
+G_SUP  --> SUP
+G_EXEC ..> CMP : JIT, cache by hash
+G_EXEC --> EXEC
+G_MEM  --> MEM
+
+' ===== adapter 2: ONNX Runtime (plugin EP) =====
+package "ONNX Runtime adapter" #FFF3E0 {
+  [OrtEp::GetCapability]            as O_SUP
+  [OrtEp::Compile]                 as O_CMP
+  [NodeComputeInfo::CreateState]   as O_LOAD
+  [NodeComputeInfo::Compute]       as O_EXEC
+  [CreateAllocator / DataTransfer] as O_MEM
 }
+O_SUP  --> SUP
+O_CMP  --> CMP
+O_LOAD --> LOAD
+O_EXEC --> EXEC
+O_MEM  --> MEM
+
+' ===== adapter 3: ExecuTorch (Backend Delegate) =====
+package "ExecuTorch adapter" #F3E5F5 {
+  [Partitioner.partition]       as E_SUP
+  [BackendDetails.preprocess]   as E_CMP
+  [BackendInterface::init]      as E_LOAD
+  [BackendInterface::execute]   as E_EXEC
+  [BackendInterface::destroy]   as E_FREE
+}
+E_SUP  --> SUP
+E_CMP  --> CMP
+E_LOAD --> LOAD
+E_EXEC --> EXEC
+E_FREE --> FREE
+
+legend right
+  Each adapter holds only its framework-specific
+  entry symbols; all arrows point INTO the single
+  hwaccel core (green). The core is implemented once.
+  Dashed arrow = optional (ggml has no AOT compile;
+  it JITs inside graph_compute and caches by hash).
+endlegend
 @enduml
 ```
 
