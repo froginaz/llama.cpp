@@ -412,6 +412,8 @@ slot 레인은 "누가 일하고 있는가"(작업 자리), seq 레인은 "KV에
 @startuml
 title 시간 축: request는 일시 점유, slot/sequence/context는 상주 (llama-server -np 2)
 
+scale 1 as 200 pixels
+
 concise "대화 A의 requests" as ReqA
 concise "대화 B/C의 requests" as ReqB
 concise "slot 0 (작업 자리)" as S0
