@@ -7,6 +7,7 @@ PlantUML 원본:
 - [12-class-diagram-ownership.puml](12-class-diagram-ownership.puml) - 구조/소유권 클래스 다이어그램
 - [12-sequence-lifecycle.puml](12-sequence-lifecycle.puml) - 생명주기 시퀀스 다이어그램 (단일 context)
 - [12-sequence-lifecycle-multi-context.puml](12-sequence-lifecycle-multi-context.puml) - 생명주기 시퀀스 다이어그램 (하나의 model을 여러 context가 공유)
+- [12-sequence-decode-batch2-multi-context.puml](12-sequence-decode-batch2-multi-context.puml) - 멀티 컨텍스트 추론 루프 상세 (batch size 2 decode)
 - [12-object-lifetime.puml](12-object-lifetime.puml) - 객체 수명 타이밍 다이어그램
 
 ---
@@ -367,7 +368,127 @@ end note
 @enduml
 ```
 
-### 5-4. 객체 수명 다이어그램
+### 5-4. 멀티 컨텍스트 추론 루프 상세: batch size 2 decode
+
+"batch size 2"는 `llama_batch.n_tokens == 2`를 뜻한다. 전형적인 예는 생성 스텝에서 두 시퀀스가 각각 1토큰씩 넣는 경우다 (`token[0]` -> seq 0, `token[1]` -> seq 1, 둘 다 `logits=1`).
+
+`llama_context::decode()` (src/llama-context.cpp:1632) 내부에서 batch 하나가 처리되는 단계:
+
+1. **배치 검증/변환**: `balloc->init()` (src/llama-context.cpp:1683) -> `n_tokens_all=2`, `n_outputs_all=2` 산출. `sched_reserve()`는 이미 예약돼 있으면 no-op.
+2. **ubatch 분할 + KV 슬롯 예약**: `memory->init_batch(*balloc, n_ubatch)` (src/llama-context.cpp:1723)가 batch를 ubatch들로 쪼개고 KV 슬롯을 계획한 `mctx`를 돌려준다. `n_ubatch >= 2`이면 2토큰짜리 ubatch 1개, `n_ubatch == 1`이면 1토큰 ubatch 2개가 되어 처리 루프가 2회 돈다. 슬롯 부족(`FAILED_PREPARE`) 시 `memory_update(true)`로 캐시 최적화 후 1회 재시도.
+3. **ubatch 처리 루프** (`process_ubatch`, src/llama-context.cpp:1257):
+   - `mctx->apply()`로 KV 슬롯 확정
+   - **그래프 재사용 판정** (`can_reuse`, src/llama-context.cpp:1271): 직전 decode와 토폴로지가 같으면 `gf_res_prev`를 재사용(`n_reused++`). 매 스텝 n_tokens=2가 반복되는 생성 루프에서는 대부분 이 경로를 탄다. 토폴로지가 바뀌었으면 `sched_reset` -> `model.build_graph()` -> `sched_alloc_graph`.
+   - `res->set_inputs(ubatch)`: 토큰 id 2개, pos, KV mask를 입력 텐서로 복사
+   - `graph_compute(gf, batched=true)`: `n_tokens > 1`이므로 batched=true -> `n_threads_batch` 사용. sched가 split별로 백엔드(자기 전용 스트림)에 비동기 실행.
+   - logits 추출: `ggml_backend_tensor_get_async`로 `buf_output`에 2행(`2 x n_vocab`) 복사
+4. **App에서 결과 사용**: `llama_get_logits_ith(0)`, `(1)` - 첫 접근 시 `synchronize()`로 async 복사 완료를 보장. seq0/seq1 각각 샘플링해서 다음 스텝의 2토큰 배치를 다시 구성.
+
+멀티 컨텍스트 관점에서 중요한 점:
+
+- ctx2도 같은 1~4 단계를 **자기 소유물(balloc, sched, 컴퓨트 버퍼, 스트림, KV, 출력 버퍼)로 독립 수행**하며, 공유하는 것은 model 가중치(읽기 전용)뿐이다.
+- 같은 GPU에서 두 context가 동시에 돌면 각자의 backend 인스턴스(스트림)에 커널이 제출되고, 하드웨어 스케줄러가 이를 교차 실행한다. 소프트웨어 레벨 동기화는 필요 없다.
+- batch 안의 두 시퀀스(seq0, seq1)는 **하나의 그래프에서 함께 계산**되지만 (가중치를 1회만 읽는 배칭 효과), K/V는 각자의 시퀀스 슬롯에 기록되고 attention mask가 시퀀스 간 접근을 차단한다.
+
+```plantuml
+@startuml
+title 멀티 컨텍스트 추론 루프 상세: batch size 2 (n_tokens = 2) decode
+
+participant "App\n(스레드 A / 스레드 B)" as App
+box "llama_context #1 소유물" #F0F8FF
+  participant "llama_context #1" as C1
+  participant "batch_allocr #1" as BA1
+  participant "llama_memory_i\n(KV cache #1)" as KV1
+  participant "ggml_backend_sched #1" as S1
+  participant "ggml_backend_t #1\n(CUDA0 stream 1)" as B1
+end box
+participant "llama_model\n(weights, 공유 1벌)" as M
+box "llama_context #2 소유물" #F5FFF0
+  participant "llama_context #2" as C2
+  participant "KV cache #2" as KV2
+end box
+
+note over App
+  "batch size 2" = llama_batch.n_tokens == 2
+  예: 생성 스텝에서 두 시퀀스가 1토큰씩
+    token[0] -> seq 0, pos p0, logits=1
+    token[1] -> seq 1, pos p1, logits=1
+end note
+
+par 스레드 A: ctx1 decode 상세
+
+  App -> C1 : llama_decode(batch{n_tokens=2})
+
+  == 3-1. 배치 검증/변환 ==
+  C1 -> BA1 : balloc->init(batch, vocab, memory, n_seq_max)
+  BA1 --> C1 : n_tokens_all=2, n_outputs_all=2
+  C1 -> C1 : sched_reserve()\n(이미 예약됨 -> no-op)
+  C1 -> KV1 : memory_update(false)\n(보류된 shift/copy 처리)
+
+  == 3-2. ubatch 분할 + KV 슬롯 예약 ==
+  C1 -> KV1 : memory->init_batch(balloc, n_ubatch)
+  KV1 --> C1 : mctx (ubatch 목록 + 슬롯 계획)
+  note right of C1
+    n_ubatch >= 2 이므로 ubatch 1개(2토큰)로 처리.
+    n_ubatch == 1 이었다면 1토큰 ubatch 2개
+    -> 아래 루프가 2회 돈다.
+    슬롯 부족(FAILED_PREPARE) 시
+    memory_update(true)로 캐시 최적화 후 1회 재시도.
+  end note
+  C1 -> C1 : output_reserve(2)\n(buf_output #1에 2행 확보)
+
+  == 3-3. ubatch 처리 (여기서는 1회) ==
+  loop mctx의 각 ubatch
+    C1 -> KV1 : mctx->apply() - KV 슬롯 확정
+    alt 그래프 재사용 (can_reuse: 직전 decode와 동일 토폴로지)
+      C1 -> C1 : gf_res_prev 재사용, n_reused++
+      note right : 매 스텝 n_tokens=2가 반복되는\n생성 루프에서는 대부분 이 경로
+    else 토폴로지 변경 (첫 호출, n_tokens 변화 등)
+      C1 -> S1 : ggml_backend_sched_reset()
+      C1 -> M : build_graph(gparams) [const, 읽기 전용]
+      M --> C1 : ggml_cgraph (2-token 폭 그래프)
+      C1 -> S1 : ggml_backend_sched_alloc_graph(gf)
+      S1 -> S1 : 노드별 backend 배정 + split\n+ 컴퓨트 버퍼 #1에 활성값 배치
+    end
+    C1 -> C1 : res->set_inputs(ubatch)\n(토큰 id 2개, pos, KV mask 입력 텐서에 복사)
+    C1 -> S1 : graph_compute(gf, batched=true)
+    note right : n_tokens > 1 이므로 batched=true\n-> n_threads_batch 사용
+    S1 -> B1 : split별 비동기 실행 (ctx1 전용 스트림)
+    B1 -> M : 가중치 읽기 (모든 context 공유)
+    B1 -> KV1 : seq0, seq1의 K/V를 각자 슬롯에 기록\n+ attention에서 과거 KV 읽기
+    S1 --> C1 : GGML_STATUS_SUCCESS
+    C1 -> C1 : logits 추출: tensor_get_async\n-> buf_output #1 [2 x n_vocab]
+  end
+
+  C1 --> App : return 0
+  App -> C1 : llama_get_logits_ith(0), (1)
+  note right : 첫 접근 시 synchronize()로\nasync 복사 완료 보장
+  App -> App : seq0/seq1 각각 샘플링\n-> 다음 스텝도 n_tokens=2 배치 구성
+
+else 스레드 B: ctx2 동일 파이프라인 (요약)
+
+  App -> C2 : llama_decode(batch'{n_tokens=2})
+  C2 -> M : build_graph() 또는 그래프 재사용 [읽기 전용]
+  C2 -> KV2 : 자기 KV만 기록/읽기 (ctx1과 무간섭)
+  C2 --> App : logits -> buf_output #2
+  note right of C2
+    ctx1과 같은 3-1 ~ 3-3 단계를
+    자기 소유물(balloc/sched/stream/KV)로
+    독립 수행. model 가중치만 공유.
+  end note
+
+end
+
+note over M
+  두 context가 동시에 실행되어도:
+  - model(가중치)은 읽기 전용 공유 -> 동기화 불필요
+  - KV/컴퓨트 버퍼/출력 버퍼/스트림은 context별 소유 -> 충돌 없음
+  - 같은 GPU에서는 두 스트림의 커널이 하드웨어 스케줄러에 의해 교차 실행
+end note
+@enduml
+```
+
+### 5-5. 객체 수명 다이어그램
 
 ```plantuml
 @startuml

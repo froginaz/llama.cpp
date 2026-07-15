@@ -150,7 +150,7 @@ Walking the stages in execution order:
 - [09-sequence-gguf-to-cgraph.wsd](09-sequence-gguf-to-cgraph.wsd) — PlantUML sequence: GGUF + per-arch C++ ⇒ `ggml_cgraph`.
 - [10-llama-model-class-diagram.wsd](10-llama-model-class-diagram.wsd) — PlantUML class diagram of `src/llama-model.h`.
 - [11-hw-backend-abstraction.md](11-hw-backend-abstraction.md) — abstracting one HW accelerator across **llama.cpp / ggml, ONNX Runtime, and ExecuTorch** backend APIs (entry points, comparison, a common `hwaccel.h`).
-- [12-context-model-backend-ownership.md](12-context-model-backend-ownership.md) — `llama_context` / `llama_model` / ggml-backend relationships, ownership, and lifecycle (Korean), with PlantUML sources: [class diagram](12-class-diagram-ownership.puml), [lifecycle sequence](12-sequence-lifecycle.puml), [multi-context lifecycle sequence](12-sequence-lifecycle-multi-context.puml), [object lifetime](12-object-lifetime.puml).
+- [12-context-model-backend-ownership.md](12-context-model-backend-ownership.md) — `llama_context` / `llama_model` / ggml-backend relationships, ownership, and lifecycle (Korean), with PlantUML sources: [class diagram](12-class-diagram-ownership.puml), [lifecycle sequence](12-sequence-lifecycle.puml), [multi-context lifecycle sequence](12-sequence-lifecycle-multi-context.puml), [multi-context batch-2 decode](12-sequence-decode-batch2-multi-context.puml), [object lifetime](12-object-lifetime.puml).
 
 ---
 
