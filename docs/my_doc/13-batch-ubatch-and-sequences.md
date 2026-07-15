@@ -1,6 +1,6 @@
 # batch, ubatch, sequence: llama.cpp의 실행 데이터 단위
 
-[12번 문서](12-context-model-backend-ownership.md)가 `llama_context` / `llama_model` / ggml-backend의 **객체 구조**(소유권, 생명주기)를 다룬다면, 이 문서는 그 위에서 **실행 데이터가 흐르는 단위** - batch(논리), ubatch(물리), sequence(대화) - 를 다룬다. 요청이 어떤 단위로 묶이고, 쪼개지고, 격리되는지를 정의하고, 두 개의 대화를 예로 decode 파이프라인 상세까지 따라간다.
+[12번 문서](12-context-model-backend-ownership.md)가 `llama_context` / `llama_model` / ggml-backend의 **객체 구조**(소유권, 생명주기)를 다룬다면, 이 문서는 그 위에서 **실행 데이터가 흐르는 단위** - batch(논리), ubatch(물리), sequence(대화) - 를 다룬다. 요청이 어떤 단위로 묶이고, 쪼개지고, 격리되는지를 정의하고, 두 개의 대화를 예로 decode 파이프라인 상세까지 따라간 뒤, 이를 실행해 볼 수 있는 번들 도구들(llama-server, llama-parallel, llama-batched 등)의 사용법을 정리한다.
 
 PlantUML 원본:
 
@@ -254,6 +254,60 @@ end note
 
 ---
 
+## 4. 1 context + multi-sequence를 실행하는 도구들
+
+번들 실행 파일 중 "llama_context 1개 + sequence 여러 개"를 실제로 돌려볼 수 있는 것은 `llama-server`, `llama-parallel`, `llama-batched`, `llama-batched-bench` 4개다. `llama-cli`, `llama-simple`은 단일 sequence 전용이다.
+
+| Executable | 1 ctx + multi-seq | sequence의 의미 |
+|---|---|---|
+| **llama-server** | O | HTTP 슬롯 = sequence (실서비스용) |
+| **llama-parallel** | O | 가상 클라이언트 = sequence (서빙 시뮬레이션) |
+| **llama-batched** | O | 같은 프롬프트에서 N개 이어쓰기 생성 |
+| **llama-batched-bench** | O | 배치 디코딩 성능 벤치마크 |
+| llama-cli | X | 대화 1개, seq 0만 사용 |
+| llama-simple / simple-chat | X | `llama_batch_get_one()`으로 seq 0만 사용 (examples/simple/simple.cpp:149) |
+
+공통 스위치는 **`-np` (`--parallel`)** 다. 이 값이 `n_parallel` -> `llama_context_params.n_seq_max`로 전달되어 "context 1개 안의 sequence 수"가 된다 (common/arg.cpp:2159~2173).
+
+### llama-server - 실서비스에서 슬롯 병렬 처리
+
+```bash
+llama-server -m model.gguf -c 16384 -np 4
+```
+
+슬롯 4개 = sequence 4개. 동시에 들어온 HTTP 요청이 각 슬롯(seq_id)에 배정되어 하나의 batch로 묶여 decode된다. `-c 16384`면 슬롯당 `n_ctx_seq = 4096`. `--kv-unified`를 켜면 슬롯들이 KV 예산을 공유한다 (tools/server/README.md).
+
+### llama-parallel - 서빙 시뮬레이션
+
+```bash
+llama-parallel -m model.gguf -np 8 -ns 128 --top-k 1 -pps --junk 10 -c 16384
+```
+
+`-np 8`: 동시 클라이언트(sequence) 8개, `-ns 128`: 총 요청 128개, `-pps`: 시스템 프롬프트를 모든 sequence가 공유(한 번만 prefill). [2장](#2-예제로-보는-context-vs-sequence와-논리물리-배치)에서 다룬 "여러 대화가 한 batch에 섞여 들어가는" 동작을 가장 직접적으로 관찰할 수 있는 예제다 (examples/parallel).
+
+### llama-batched - 한 프롬프트에서 N개 생성
+
+```bash
+llama-batched -m model.gguf -p "Hello my name is" -np 4 --kv-unified
+```
+
+프롬프트를 seq 0으로 1회 prefill -> `llama_memory_seq_cp`로 KV를 seq 1..3에 복사 -> 매 스텝 `n_tokens=4` batch로 4개 시퀀스가 동시에 생성된다. 소스(examples/batched/batched.cpp:120~)가 `llama_batch`에 seq_id를 직접 채우는 가장 작은 교과서 코드라, [2장](#2-예제로-보는-context-vs-sequence와-논리물리-배치) 예제를 코드로 확인하기 좋다. [3장](#3-decode-상세-batch-size-2가-처리되는-과정)의 batch size 2 다이어그램은 `llama-batched -np 2`의 매 스텝과 정확히 일치한다.
+
+### llama-batched-bench - 성능 측정
+
+```bash
+llama-batched-bench -m model.gguf -c 16384 -b 2048 -ub 512 -ngl 99 \
+    -npp 128,256,512 -ntg 128,256 -npl 1,2,4,8,16,32
+```
+
+`-npl` = 동시 sequence 수를 1~32로 바꿔가며 PP(prefill)/TG(generation) 처리량을 측정한다. sequence 수에 따른 배칭 효율 변화를 수치로 보고 싶을 때 사용한다 (tools/batched-bench).
+
+### 참고: speculative / lookahead
+
+`llama-speculative`, `llama-lookahead`도 내부적으로 한 context에서 여러 seq_id를 쓰지만, 독립 대화가 아니라 하나의 대화에 대한 draft 분기용이라 "multi-sequence 서빙"과는 목적이 다르다.
+
+---
+
 ## 핵심 요약
 
 1. **batch = 논리 단위**: `llama_decode()` 1회 제출 묶음. prefill/decode 구분 없이 여러 sequence의 토큰을 혼합할 수 있고, 그 자체로는 연산이 일어나지 않는다.
@@ -261,3 +315,4 @@ end note
 3. **sequence = 대화**: 일상어 "컨텍스트(대화 문맥)"에 해당하는 것은 `llama_context`가 아니라 sequence(`llama_seq_id`)다. `llama_context`는 여러 sequence를 수용하는 실행 엔진이다.
 4. **격리는 seq_id로**: 같은 그래프에서 함께 계산돼도 KV 슬롯과 attention mask가 sequence 간 접근을 차단하므로 결과는 개별 실행과 동일하다.
 5. **다중화는 sequence로, 격리는 context로**: 배칭 효율이 필요하면 한 context에 여러 sequence, 완전한 격리/개별 설정/스레드 병렬이 필요하면 context를 분리한다.
+6. **직접 실행해 보려면**: `-np`(`--parallel`)가 sequence 수를 결정한다. 실서비스는 `llama-server -np N`, 시뮬레이션은 `llama-parallel`, 최소 예제 코드는 `llama-batched`, 벤치마크는 `llama-batched-bench`.
