@@ -1,0 +1,81 @@
+@startuml
+title llama_context / llama_model / ggml-backend : 구조와 소유권
+skinparam linetype ortho
+
+package "Application" {
+  class App
+}
+
+package "llama layer" {
+  class llama_model {
+    +hparams : llama_hparams
+    +vocab : llama_vocab
+    +layers : vector<llama_layer>
+    +devices : vector<llama_device>
+    -pimpl.ctxs_bufs : (ggml_context_ptr, buffer_ptr[])[]
+    -pimpl.dev_input / dev_layer[] / dev_output
+    +create_memory() : llama_memory_i*
+    +build_graph() : ggml_cgraph*
+    +dev_layer(il) : ggml_backend_dev_t
+  }
+
+  class llama_context {
+    -model : const llama_model &
+    -cparams : llama_cparams
+    -backends : vector<ggml_backend_ptr>
+    -backend_cpu : ggml_backend_t
+    -sched : ggml_backend_sched_ptr
+    -memory : unique_ptr<llama_memory_i>
+    -buf_output : ggml_backend_buffer_ptr
+    +decode(batch) : int
+    +encode(batch) : int
+    +sched_reserve()
+  }
+
+  class "llama_memory_i\n(KV cache)" as kv
+}
+
+package "ggml-backend layer" {
+  class "ggml_backend_reg_t\n(registry, global)" as reg
+  class "ggml_backend_dev_t\n(physical device)" as dev
+  class "ggml_backend_t\n(exec instance)" as backend
+  class "ggml_backend_buffer_type_t\n(allocator)" as buft
+  class "ggml_backend_buffer_t\n(memory)" as buffer
+  class "ggml_backend_sched_t\n(graph scheduler)" as sched
+}
+
+' ownership (composition = owning)
+App *-- llama_model : owns\n(llama_model_free)
+App *-- llama_context : owns\n(llama_free)
+
+llama_model *-- "n" buffer : weight buffers\n(ggml_backend_buffer_ptr)
+llama_context *-- "n" backend : ggml_backend_ptr\n(per device + CPU)
+llama_context *-- sched : ggml_backend_sched_ptr
+llama_context *-- kv : unique_ptr
+llama_context *-- buffer : buf_output (host)
+kv *-- "n" buffer : KV tensors
+sched *-- "n" buffer : compute buffers
+
+' non-owning references (dashed)
+llama_context ..> llama_model : const & (read-only,\nmust outlive context)
+llama_model ..> "n" dev : devices[] / dev_layer[]\n(placement plan, non-owning)
+sched ..> backend : non-owning refs
+backend ..> dev : runs on
+buffer ..> buft : allocated from
+dev *-- buft : provides
+reg *-- "n" dev : enumerates (process lifetime)
+
+' factory relation
+llama_model ..> kv : <<creates>>\ncreate_memory()
+llama_model ..> "ggml_cgraph" : <<creates>>\nbuild_graph()
+
+note bottom of llama_model
+  불변(immutable) 가중치.
+  여러 llama_context가 공유 가능.
+end note
+
+note bottom of llama_context
+  가변(mutable) 추론 상태.
+  KV 캐시, 스케줄러, 출력 버퍼 소유.
+end note
+@enduml

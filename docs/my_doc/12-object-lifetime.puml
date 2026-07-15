@@ -1,0 +1,27 @@
+@startuml
+title 객체 수명(lifetime)의 포함 관계
+concise "process (ggml registry, devices)" as P
+concise "llama_model (weights)" as M
+concise "llama_context #1" as C1
+concise "llama_context #2" as C2
+
+@0
+P is "alive"
+@1
+M is "alive"
+@2
+C1 is "alive"
+@3
+C2 is "alive"
+@5
+C1 is {hidden}
+@7
+C2 is {hidden}
+@8
+M is {hidden}
+@10
+P is {hidden}
+
+highlight 2 to 5 #lightblue : ctx1 lifetime < model lifetime
+highlight 3 to 7 #lightgreen : ctx2 lifetime < model lifetime
+@enduml

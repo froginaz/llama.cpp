@@ -1,0 +1,55 @@
+@startuml
+title 생명주기: 로드 -> 컨텍스트 생성 -> 추론 -> 해제
+
+participant App
+participant "llama_model" as M
+participant "llama_context" as C
+participant "ggml registry\n(devices)" as R
+participant "ggml_backend_t" as B
+participant "ggml_backend_sched" as S
+participant "llama_memory_i\n(KV cache)" as KV
+
+== 1. 모델 로드 ==
+App -> M : llama_model_load_from_file()
+M -> R : 디바이스 열거/선택 -> model.devices
+M -> M : 레이어별 디바이스 배치 결정\n(dev_input / dev_layer[] / dev_output)
+M -> R : buft로 가중치 버퍼 할당
+note right : 가중치가 VRAM/RAM에 업로드됨\n(model이 버퍼 소유)
+
+== 2. 컨텍스트 생성 ==
+App -> C : llama_init_from_model(model, params)
+C -> C : model을 const&로 저장 (비소유)
+loop model.devices 각각
+  C -> R : ggml_backend_dev_init(dev)
+  R --> B : create
+  C -> C : backends[]에 소유 (unique_ptr)
+end
+C -> C : + ACCEL, CPU 백엔드 생성
+C -> C : output_reserve() -> buf_output 할당
+C -> M : create_memory(params, cparams)
+M --> KV : create (factory)
+C -> C : memory로 소유 (unique_ptr)
+C -> S : sched_reserve():\nggml_backend_sched_new(backends, bufts)
+S -> S : worst-case 그래프 예약\n-> 컴퓨트 버퍼 할당
+
+== 3. 추론 루프 ==
+loop 매 배치
+  App -> C : llama_decode(batch)
+  C -> M : build_graph(params)
+  M --> C : ggml_cgraph (레이어->디바이스 배치 반영)
+  C -> S : graph_compute(gf)
+  S -> B : split별 비동기 실행\n(백엔드 간 텐서 복사 포함)
+  B -> KV : KV 텐서 읽기/쓰기
+  S --> C : GGML_STATUS_SUCCESS
+  C -> C : logits/embd를 buf_output(호스트)으로
+end
+
+== 4. 해제 (순서 중요) ==
+App -> C : llama_free(ctx)
+destroy C
+note right of C : RAII 역순 해제:\nsched(컴퓨트 버퍼) -> KV 캐시\n-> backends -> buf_output\n** model은 그대로 **
+App -> M : llama_model_free(model)
+destroy M
+note right of M : 가중치 버퍼, mmap, LoRA 해제\n(모든 context 해제 후에만!)
+note over R : 디바이스/레지스트리는\n프로세스 종료까지 유지
+@enduml
