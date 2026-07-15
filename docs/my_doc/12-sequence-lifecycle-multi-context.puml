@@ -1,0 +1,88 @@
+@startuml
+title 멀티 컨텍스트: 하나의 model을 여러 context가 공유하는 경우
+
+participant App
+participant "llama_model\n(weights, 1벌)" as M
+participant "llama_context #1" as C1
+participant "llama_context #2" as C2
+participant "ggml registry\n(devices)" as R
+participant "KV cache #1" as KV1
+participant "KV cache #2" as KV2
+
+== 1. 모델 로드 (프로세스에서 한 번만) ==
+App -> M : llama_model_load_from_file()
+M -> R : 디바이스 선택 -> model.devices\n가중치 버퍼 할당/업로드
+note right of M
+  가중치와 레이어->디바이스 배치는
+  단 한 벌만 존재.
+  이후 모든 context가 읽기 전용 공유.
+end note
+
+== 2. 컨텍스트 생성 (context마다 전 과정 반복) ==
+App -> C1 : llama_init_from_model(model, params1)
+C1 -> R : ggml_backend_dev_init(dev) x N
+note right of C1
+  backend 인스턴스, sched,
+  컴퓨트 버퍼, buf_output은
+  context마다 별도 생성 (공유 안 함)
+end note
+C1 -> M : create_memory(params1, cparams1)
+M --> KV1 : create (factory)
+C1 -> C1 : sched_reserve() -> 컴퓨트 버퍼 #1
+
+App -> C2 : llama_init_from_model(model, params2)
+C2 -> R : ggml_backend_dev_init(dev) x N
+C2 -> M : create_memory(params2, cparams2)
+M --> KV2 : create (factory)
+C2 -> C2 : sched_reserve() -> 컴퓨트 버퍼 #2
+
+note over C1, C2
+  같은 디바이스(예: CUDA0)에 backend 인스턴스가 두 벌 생김
+  (= 독립 실행 스트림 2개).
+  n_ctx, n_batch 등 cparams는 context마다 달라도 됨.
+  메모리 비용 = 가중치(1벌) + N x (KV + 컴퓨트 버퍼 + 출력 버퍼)
+end note
+
+== 3. 추론 루프 (context끼리 독립, 병렬 가능) ==
+par context #1 (예: 스레드 A)
+  App -> C1 : llama_decode(batch1)
+  C1 -> M : build_graph() [const, 읽기 전용]
+  C1 -> KV1 : 자기 KV만 읽기/쓰기
+  C1 --> App : logits -> buf_output #1
+else context #2 (예: 스레드 B)
+  App -> C2 : llama_decode(batch2)
+  C2 -> M : build_graph() [const, 읽기 전용]
+  C2 -> KV2 : 자기 KV만 읽기/쓰기
+  C2 --> App : logits -> buf_output #2
+end
+
+note over M
+  model은 불변이므로 여러 context가 동시에 읽어도 안전.
+  단, "하나의 context"를 여러 스레드가 동시에 호출하는 것은 불가
+  (context 내부 상태는 동기화되지 않음).
+end note
+
+== 4. 해제 (context 간 순서는 자유, model은 반드시 마지막) ==
+App -> C1 : llama_free(ctx1)
+destroy KV1
+destroy C1
+note right of C1
+  ctx1의 sched/KV/backend 인스턴스/출력 버퍼만 해제.
+  가중치는 그대로 -> ctx2는 계속 추론 가능
+end note
+
+App -> C2 : llama_decode(batch2) 계속 사용 가능
+C2 --> App : logits
+
+App -> C2 : llama_free(ctx2)
+destroy KV2
+destroy C2
+
+App -> M : llama_model_free(model)
+destroy M
+note right of M
+  모든 context가 해제된 후에만 호출.
+  살아있는 context가 남아 있으면
+  dangling reference (const llama_model &)
+end note
+@enduml
