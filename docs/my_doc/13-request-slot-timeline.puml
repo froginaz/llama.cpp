@@ -24,9 +24,9 @@ concise "llama_context (실행 엔진)" as CTX <<ctx>>
 ReqA is {hidden}
 ReqB is {hidden}
 S0 is "idle"
-Q0 is "비어 있음"
+Q0 is {hidden}
 S1 is "idle"
-Q1 is "비어 있음"
+Q1 is {hidden}
 CTX is "alive (n_seq_max=2, seq 0/1 수용)"
 
 @1
