@@ -343,6 +343,27 @@ llama_model (가중치)
 session file = context 상태(또는 slot/sequence 하나의 상태)의 디스크 스냅샷
 ```
 
+### session : sequence = 1:1인가?
+
+"session은 sequence당 KV를 하나 담으니 1:1"이라는 이해는 **내용물 기준으로만 맞고, 관계의 성격까지 1:1로 보면 틀리다**. 두 가지를 구분해야 한다.
+
+**첫째, session에는 두 가지 종류(granularity)가 있다** (include/llama.h, src/llama-context.h:145~176):
+
+| 종류 | API | 담는 내용 | sequence와의 관계 |
+|---|---|---|---|
+| **context 전체 session** | `llama_state_save_file` (llama-cli `--prompt-cache`) | context의 전체 상태 = **모든 sequence의 KV** + 출력 상태 | **1 : N** (그 context의 seq 전부) |
+| **sequence 단위 session** | `llama_state_seq_save_file` (server `--slot-save-path`, `/slots/{id}?action=save`) | **sequence 1개**의 KV 스트림 | 내용물 기준 **1 : 1** |
+
+"session = sequence당 KV 하나"는 sequence 단위 session에만 해당한다. llama-cli `--prompt-cache`가 만드는 session 파일은 context 전체 스냅샷이라 1:1이 아니다.
+
+**둘째, sequence 단위 session이라도 slot==sequence 같은 등식은 아니다.** slot==sequence는 살아있는 두 객체 사이의 고정된 identity(slot.id가 곧 seq_id)지만, session:sequence는 **스냅샷 관계**라서 카디널리티가 시간에 걸쳐 N:M이다:
+
+- **한 sequence -> 여러 session**: 같은 대화를 시점을 달리해 여러 번 저장하면 파일이 여러 개 생긴다.
+- **한 session -> 여러 sequence**: 저장된 파일은 다른 seq_id, 다른 slot, 다른 프로세스의 context에도 복원할 수 있다 (같은 model 필요). 예: 공통 시스템 프롬프트의 KV를 하나 저장해 두고 여러 slot에 복원.
+- **수명이 다르다**: sequence가 지워져도(KV 교체) session 파일은 남고, 서버 재시작 후에도 복원할 수 있다.
+
+정리하면: **"sequence 단위 session 파일 하나는 특정 시점의 sequence 하나의 상태를 담는다"(스냅샷 단위 1:1)까지만 맞다.** 비유하자면 slot:sequence가 "좌석과 좌석번호"라면, session:sequence는 "사진과 피사체"다 - 사진 한 장에 피사체는 하나지만, 같은 피사체를 여러 번 찍을 수도, 사진을 여러 곳에 복사할 수도 있다.
+
 ### 구조 다이어그램
 
 ```plantuml
@@ -497,4 +518,4 @@ caption 상태 색 = 대화 소속 (파랑: A, 초록: B, 노랑: C) / 레인 �
 4. **격리는 seq_id로**: 같은 그래프에서 함께 계산돼도 KV 슬롯과 attention mask가 sequence 간 접근을 차단하므로 결과는 개별 실행과 동일하다.
 5. **다중화는 sequence로, 격리는 context로**: 배칭 효율이 필요하면 한 context에 여러 sequence, 완전한 격리/개별 설정/스레드 병렬이 필요하면 context를 분리한다.
 6. **직접 실행해 보려면**: `-np`(`--parallel`)가 sequence 수를 결정한다. 실서비스는 `llama-server -np N`, 시뮬레이션은 `llama-parallel`, 최소 예제 코드는 `llama-batched`, 벤치마크는 `llama-batched-bench`.
-7. **서버 용어 등식은 slot == sequence 하나뿐**: request는 slot에 일시 배정되는 일감이고, session은 context/sequence 상태의 디스크 스냅샷 파일이다. 웹 서비스 의미의 "세션(대화)"은 context가 아니라 sequence에 대응한다.
+7. **서버 용어 등식은 slot == sequence 하나뿐**: request는 slot에 일시 배정되는 일감이고, session은 context/sequence 상태의 디스크 스냅샷 파일이다. 웹 서비스 의미의 "세션(대화)"은 context가 아니라 sequence에 대응한다. session:sequence는 스냅샷 관계다 - sequence 단위 저장이면 내용물은 1:1이지만, 저장/복원 카디널리티는 N:M이고 context 전체 session(1:N)도 있다.
