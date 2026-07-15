@@ -4,6 +4,7 @@
 
 PlantUML 원본:
 
+- [13-sequence-decode-batch2-single-context.puml](13-sequence-decode-batch2-single-context.puml) - batch size 2 decode 상세 시퀀스 다이어그램 (단일 컨텍스트, 기본형)
 - [13-sequence-decode-batch2-multi-context.puml](13-sequence-decode-batch2-multi-context.puml) - batch size 2 decode 상세 시퀀스 다이어그램 (멀티 컨텍스트)
 - [13-request-slot-session-structure.puml](13-request-slot-session-structure.puml) - request/slot/session/sequence/context 구조 다이어그램
 - [13-request-slot-timeline.puml](13-request-slot-timeline.puml) - slot 점유 시간 축 다이어그램
@@ -136,7 +137,7 @@ ctx1에 대화 1(그 안에서는 seq 0), ctx2에 대화 2(역시 자기 seq 0)�
 
 ## 3. decode 상세: batch size 2가 처리되는 과정
 
-"batch size 2"는 `llama_batch.n_tokens == 2`를 뜻한다. 전형적인 예는 생성 스텝에서 두 시퀀스가 각각 1토큰씩 넣는 경우다 (`token[0]` -> seq 0, `token[1]` -> seq 1, 둘 다 `logits=1`) - 바로 [2장](#2-예제로-보는-context-vs-sequence와-논리물리-배치) 예제의 4단계 상황이다. 아래 다이어그램은 멀티 컨텍스트 환경(context 2개가 model을 공유)에서 ctx1의 decode 내부를 상세히, ctx2를 요약으로 보여준다.
+"batch size 2"는 `llama_batch.n_tokens == 2`를 뜻한다. 전형적인 예는 생성 스텝에서 두 시퀀스가 각각 1토큰씩 넣는 경우다 (`token[0]` -> seq 0, `token[1]` -> seq 1, 둘 다 `logits=1`) - 바로 [2장](#2-예제로-보는-context-vs-sequence와-논리물리-배치) 예제의 4단계 상황이다. 다이어그램은 두 가지다: 먼저 **단일 컨텍스트 기본형**으로 decode 내부를 보고, 이어서 **멀티 컨텍스트 확장형**(context 2개가 model을 공유, ctx1 상세 + ctx2 요약)으로 확장한다.
 
 `llama_context::decode()` (src/llama-context.cpp:1632) 내부에서 batch 하나가 처리되는 단계:
 
@@ -149,6 +150,88 @@ ctx1에 대화 1(그 안에서는 seq 0), ctx2에 대화 2(역시 자기 seq 0)�
    - `graph_compute(gf, batched=true)`: `n_tokens > 1`이므로 batched=true -> `n_threads_batch` 사용. sched가 split별로 백엔드(자기 전용 스트림)에 비동기 실행.
    - logits 추출: `ggml_backend_tensor_get_async`로 `buf_output`에 2행(`2 x n_vocab`) 복사
 4. **App에서 결과 사용**: `llama_get_logits_ith(0)`, `(1)` - 첫 접근 시 `synchronize()`로 async 복사 완료를 보장. seq0/seq1 각각 샘플링해서 다음 스텝의 2토큰 배치를 다시 구성.
+
+### 단일 컨텍스트 (기본형)
+
+```plantuml
+@startuml
+title 단일 컨텍스트 추론 루프 상세: batch size 2 (n_tokens = 2) decode
+
+participant App
+box "llama_context 소유물" #F0F8FF
+  participant "llama_context" as C
+  participant "batch_allocr" as BA
+  participant "llama_memory_i\n(KV cache)" as KV
+  participant "ggml_backend_sched" as S
+  participant "ggml_backend_t\n(CUDA0 stream)" as B
+end box
+participant "llama_model\n(weights)" as M
+
+note over App
+  "batch size 2" = llama_batch.n_tokens == 2
+  예: 생성 스텝에서 두 시퀀스가 1토큰씩
+    token[0] -> seq 0, pos p0, logits=1
+    token[1] -> seq 1, pos p1, logits=1
+end note
+
+App -> C : llama_decode(batch{n_tokens=2})
+
+== 1. 배치 검증/변환 ==
+C -> BA : balloc->init(batch, vocab, memory, n_seq_max)
+BA --> C : n_tokens_all=2, n_outputs_all=2
+C -> C : sched_reserve()\n(이미 예약됨 -> no-op)
+C -> KV : memory_update(false)\n(보류된 shift/copy 처리)
+
+== 2. ubatch 분할 + KV 슬롯 예약 ==
+C -> KV : memory->init_batch(balloc, n_ubatch)
+KV --> C : mctx (ubatch 목록 + 슬롯 계획)
+note right of C
+  n_ubatch >= 2 이므로 ubatch 1개(2토큰)로 처리.
+  n_ubatch == 1 이었다면 1토큰 ubatch 2개
+  -> 아래 루프가 2회 돈다.
+  슬롯 부족(FAILED_PREPARE) 시
+  memory_update(true)로 캐시 최적화 후 1회 재시도.
+end note
+C -> C : output_reserve(2)\n(buf_output에 2행 확보)
+
+== 3. ubatch 처리 (여기서는 1회) ==
+loop mctx의 각 ubatch
+  C -> KV : mctx->apply() - KV 슬롯 확정
+  alt 그래프 재사용 (can_reuse: 직전 decode와 동일 토폴로지)
+    C -> C : gf_res_prev 재사용, n_reused++
+    note right : 매 스텝 n_tokens=2가 반복되는\n생성 루프에서는 대부분 이 경로
+  else 토폴로지 변경 (첫 호출, n_tokens 변화 등)
+    C -> S : ggml_backend_sched_reset()
+    C -> M : build_graph(gparams) [const, 읽기 전용]
+    M --> C : ggml_cgraph (2-token 폭 그래프)
+    C -> S : ggml_backend_sched_alloc_graph(gf)
+    S -> S : 노드별 backend 배정 + split\n+ 컴퓨트 버퍼에 활성값 배치
+  end
+  C -> C : res->set_inputs(ubatch)\n(토큰 id 2개, pos, KV mask 입력 텐서에 복사)
+  C -> S : graph_compute(gf, batched=true)
+  note right : n_tokens > 1 이므로 batched=true\n-> n_threads_batch 사용
+  S -> B : split별 비동기 실행
+  B -> M : 가중치 읽기
+  B -> KV : seq0, seq1의 K/V를 각자 슬롯에 기록\n+ attention에서 과거 KV 읽기
+  S --> C : GGML_STATUS_SUCCESS
+  C -> C : logits 추출: tensor_get_async\n-> buf_output [2 x n_vocab]
+end
+
+C --> App : return 0
+App -> C : llama_get_logits_ith(0), (1)
+note right : 첫 접근 시 synchronize()로\nasync 복사 완료 보장
+App -> App : seq0/seq1 각각 샘플링\n-> 다음 스텝도 n_tokens=2 배치 구성
+
+note over KV
+  batch 안의 두 시퀀스(seq0, seq1)는 하나의 그래프에서
+  함께 계산되지만 (가중치 1회 읽기 = 배칭 효과),
+  K/V는 각자의 시퀀스 슬롯에 기록되고
+  attention mask가 시퀀스 간 접근을 차단한다.
+end note
+@enduml
+```
+
+### 멀티 컨텍스트 (확장형)
 
 멀티 컨텍스트 관점에서 중요한 점:
 
