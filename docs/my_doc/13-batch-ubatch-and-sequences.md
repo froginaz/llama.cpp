@@ -406,53 +406,71 @@ end note
 
 수명 차이가 핵심이다: request(초 단위) < slot/sequence/context(서버 수명) < session file(프로세스보다 오래 살 수 있음).
 
+slot 레인은 "누가 일하고 있는가"(작업 자리), seq 레인은 "KV에 무엇이 쌓여 있는가"(데이터), context 레인은 이 모두를 담는 그릇을 보여준다. slot이 idle이어도 seq의 KV는 남아 있다는 것이 둘을 분리해서 봐야 하는 이유다.
+
 ```plantuml
 @startuml
-title 시간 축: slot은 상주, request는 일시 점유 (llama-server -np 2)
+title 시간 축: request는 일시 점유, slot/sequence/context는 상주 (llama-server -np 2)
 
 concise "대화 A의 requests" as ReqA
 concise "대화 B/C의 requests" as ReqB
-concise "slot 0 (= seq 0)" as S0
-concise "slot 1 (= seq 1)" as S1
+concise "slot 0 (작업 자리)" as S0
+concise "seq 0 (KV 스트림)" as Q0
+concise "slot 1 (작업 자리)" as S1
+concise "seq 1 (KV 스트림)" as Q1
+concise "llama_context (실행 엔진)" as CTX
 
 @0
 ReqA is {hidden}
 ReqB is {hidden}
 S0 is "idle"
+Q0 is "비어 있음"
 S1 is "idle"
+Q1 is "비어 있음"
+CTX is "alive (n_seq_max=2, seq 0/1 수용)"
 
 @1
 ReqA is "A-req1"
 S0 is "A-req1 처리"
+Q0 is "A의 KV 기록 (prefill+decode)"
 
 @2
 ReqB is "B-req1"
 S1 is "B-req1 처리"
+Q1 is "B의 KV 기록"
 
 @3
 ReqA is {hidden}
-S0 is "idle (A의 KV 유지)"
+S0 is "idle"
+Q0 is "A의 KV 유지"
 
 @4
 ReqB is {hidden}
-S1 is "idle (B의 KV 유지)"
+S1 is "idle"
+Q1 is "B의 KV 유지"
 
 @5
 ReqA is "A-req2 (후속 질문)"
-S0 is "A-req2 처리 (KV 재사용!)"
+S0 is "A-req2 처리"
+Q0 is "A의 KV 재사용 + 이어서 기록"
 
 @6
 ReqB is "C-req1 (새 대화)"
-S1 is "C-req1 처리 (B의 KV 밀려남)"
+S1 is "C-req1 처리"
+Q1 is "B의 KV 삭제 -> C의 KV 기록"
 
 @7
 ReqA is {hidden}
 ReqB is {hidden}
 S0 is "idle"
+Q0 is "A의 KV 유지"
 S1 is "idle"
+Q1 is "C의 KV 유지"
 
-highlight 5 to 6 #lightblue : 같은 대화의 후속 request는 같은 slot으로 -> prefill 절약
-highlight 6 to 7 #FFE4E1 : 다른 대화가 slot을 차지하면 기존 KV는 교체됨
+highlight 5 to 6 #lightblue : 같은 대화의 후속 request는 같은 slot으로 -> seq 0의 KV 재사용, prefill 절약
+highlight 6 to 7 #FFE4E1 : 다른 대화가 slot을 차지하면 그 seq의 KV는 교체됨
+
+caption 수명 비교: request(짧은 구간) < slot/seq/context(전 구간 상주). slot은 "누가 일하는가", seq는 "KV에 무엇이 쌓여 있는가", context는 이 모두를 담는 그릇.
 @enduml
 ```
 
