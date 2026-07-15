@@ -580,6 +580,72 @@ API 사용자가 `llama_decode()` 한 번에 제출하는 작업 묶음. 최대 
 
 ---
 
+## 7. 예제로 보는 context vs sequence와 논리/물리 배치
+
+일상적으로 쓰는 "컨텍스트"(대화 문맥)와 llama.cpp의 `llama_context`(C++ 객체)는 다른 것이다. 두 개의 독립적인 질문을 예로 정리한다:
+
+- 대화 1: `"what is capital of france?"`
+- 대화 2: `"who is best soccer player?"`
+
+### 용어 대응
+
+| 용어 | 정체 | 이 예시에서 |
+|---|---|---|
+| **sequence** (`llama_seq_id`) | 독립적인 토큰 스트림 하나 = 대화 하나. 자기만의 위치(pos 0,1,2...)와 KV 캐시 영역을 가짐 | 대화 1 = seq 0, 대화 2 = seq 1 |
+| **`llama_context`** | 실행 엔진 객체 (KV 캐시 풀 + 스케줄러 + 버퍼). **최대 `n_seq_max`개의 sequence를 동시에 수용하는 그릇** | 보통 1개면 충분 - 두 대화 모두 이 안에서 처리 |
+| **context window** (`n_ctx`) | 용량(토큰 수). sequence들이 나눠 씀 (`n_ctx_seq = n_ctx / n_seq_max`, src/llama-context.cpp:209) | 두 대화가 쓸 수 있는 토큰 예산 |
+
+일상어의 "컨텍스트 2개"는 llama.cpp 용어로는 대부분 **"llama_context 1개 안의 sequence 2개"**다. llama-server의 슬롯이 정확히 sequence에 해당한다.
+
+### 시나리오 A (일반적): context 1개, sequence 2개
+
+토큰화 결과를 seq 0 = 7토큰, seq 1 = 6토큰이라 하자 (실제 개수는 토크나이저에 따라 다름).
+
+**1단계 - prefill: 논리 batch 1개에 두 대화를 함께 담는다** (`n_tokens = 13`):
+
+| i | token | seq_id | pos | logits |
+|---|---|---|---|---|
+| 0 | "what" | **0** | 0 | 0 |
+| 1 | "is" | **0** | 1 | 0 |
+| ... | ... | **0** | ... | 0 |
+| 6 | "?" | **0** | 6 | **1** |
+| 7 | "who" | **1** | 0 | 0 |
+| 8 | "is" | **1** | 1 | 0 |
+| ... | ... | **1** | ... | 0 |
+| 12 | "?" | **1** | 5 | **1** |
+
+**pos가 seq마다 0부터 다시 시작**한다. batch는 "두 대화를 한 번에 제출한다"는 논리적 묶음일 뿐, 두 질문이 이어진 하나의 문장이 되는 것이 아니다.
+
+**2단계 - 물리 배치(ubatch)로 분할**:
+
+- `n_ubatch = 512`(기본)라면: 13 <= 512이므로 **ubatch 1개** -> 그래프 1회 실행으로 두 질문을 동시에 계산. 가중치를 한 번만 읽으면서 13토큰을 다 처리하는 것이 배칭의 이득이다.
+- `n_ubatch = 8`이라면: `split_simple`이 [i=0..7] 8토큰, [i=8..12] 5토큰의 **ubatch 2개**로 잘라 그래프를 2회 실행한다. 두 번째 ubatch가 seq 1의 나머지를 처리해도 결과는 동일하다.
+
+**3단계 - 격리 보장**: 같은 그래프 안에서 함께 계산돼도 seq 0의 K/V는 KV 캐시의 seq 0 슬롯에, seq 1의 K/V는 seq 1 슬롯에 기록되고, **attention mask가 seq_id 기준으로 교차 접근을 차단**한다. "france" 토큰이 "soccer" 토큰을 attend할 수 없으므로, 수학적으로는 두 질문을 따로 돌린 것과 같은 결과가 나온다.
+
+**4단계 - decode: 매 스텝이 batch size 2**: prefill 후 logits 2행(각 seq의 마지막 토큰 위치)을 샘플링해서
+
+```
+batch = { token[0]: seq0의 새 토큰 (pos 7),
+          token[1]: seq1의 새 토큰 (pos 6) }   // n_tokens = 2
+```
+
+이것이 [5-4절](#5-4-멀티-컨텍스트-추론-루프-상세-batch-size-2-decode)의 상황이다. 2 <= n_ubatch이므로 항상 ubatch 1개 -> 그래프 1회로 두 대화가 동시에 한 토큰씩 전진한다. 한쪽 답이 먼저 끝나면 다음 스텝부터 batch는 n_tokens=1이 된다.
+
+### 시나리오 B (비교): llama_context를 2개 만드는 경우
+
+ctx1에 대화 1(그 안에서는 seq 0), ctx2에 대화 2(역시 자기 seq 0)를 담는 방법:
+
+- `llama_decode()`가 **각 context마다 따로** 호출되고 그래프도 각각 실행된다. **두 질문이 하나의 batch로 묶이는 일은 없다** - batch는 context 내부의 개념이기 때문이다.
+- 대신 KV 캐시, 컴퓨트 버퍼, 출력 버퍼가 context마다 별도로 생기고(메모리 증가), 스레드 2개로 병렬 실행이 가능하다 ([5-3절](#5-3-시퀀스-다이어그램-멀티-컨텍스트-하나의-model을-여러-context가-공유) 참고).
+
+### 선택 기준
+
+- 같은 설정으로 많은 대화를 효율적으로 다중화 -> **시나리오 A (sequence)**: 배칭 효과, 메모리 절약
+- 완전한 격리, 서로 다른 `n_ctx`/cparams, 스레드 병렬 -> **시나리오 B (context)**
+
+---
+
 ## 핵심 요약
 
 1. **의존 방향은 한쪽**: `llama_context` -> `llama_model` -> `ggml_backend_dev_t` 순으로만 참조하며 역참조는 없다.
