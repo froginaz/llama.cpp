@@ -1,0 +1,47 @@
+@startuml
+title 시간 축: slot은 상주, request는 일시 점유 (llama-server -np 2)
+
+concise "대화 A의 requests" as ReqA
+concise "대화 B/C의 requests" as ReqB
+concise "slot 0 (= seq 0)" as S0
+concise "slot 1 (= seq 1)" as S1
+
+@0
+ReqA is {hidden}
+ReqB is {hidden}
+S0 is "idle"
+S1 is "idle"
+
+@1
+ReqA is "A-req1"
+S0 is "A-req1 처리"
+
+@2
+ReqB is "B-req1"
+S1 is "B-req1 처리"
+
+@3
+ReqA is {hidden}
+S0 is "idle (A의 KV 유지)"
+
+@4
+ReqB is {hidden}
+S1 is "idle (B의 KV 유지)"
+
+@5
+ReqA is "A-req2 (후속 질문)"
+S0 is "A-req2 처리 (KV 재사용!)"
+
+@6
+ReqB is "C-req1 (새 대화)"
+S1 is "C-req1 처리 (B의 KV 밀려남)"
+
+@7
+ReqA is {hidden}
+ReqB is {hidden}
+S0 is "idle"
+S1 is "idle"
+
+highlight 5 to 6 #lightblue : 같은 대화의 후속 request는 같은 slot으로 -> prefill 절약
+highlight 6 to 7 #FFE4E1 : 다른 대화가 slot을 차지하면 기존 KV는 교체됨
+@enduml

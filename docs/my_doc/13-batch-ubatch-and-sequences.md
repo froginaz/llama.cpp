@@ -5,6 +5,8 @@
 PlantUML 원본:
 
 - [13-sequence-decode-batch2-multi-context.puml](13-sequence-decode-batch2-multi-context.puml) - batch size 2 decode 상세 시퀀스 다이어그램 (멀티 컨텍스트)
+- [13-request-slot-session-structure.puml](13-request-slot-session-structure.puml) - request/slot/session/sequence/context 구조 다이어그램
+- [13-request-slot-timeline.puml](13-request-slot-timeline.puml) - slot 점유 시간 축 다이어그램
 
 ---
 
@@ -308,6 +310,156 @@ llama-batched-bench -m model.gguf -c 16384 -b 2048 -ub 512 -ngl 99 \
 
 ---
 
+## 5. 용어 관계: request / slot / session / sequence / context
+
+서버 관점에서 자주 혼동되는 다섯 용어의 정확한 정의와 관계. 흔한 오해인 "session == context", "slot == sequence == request" 중 **등식이 성립하는 것은 slot == sequence 하나뿐**이다.
+
+### 정의
+
+| 용어 | 계층 | 수명 | 정의 |
+|---|---|---|---|
+| **request** | HTTP | 초 단위 (일시적) | `POST /completion` 1회. 처리가 끝나면 사라지는 일감. `id_slot`으로 특정 slot을 지정할 수도 있다 |
+| **slot** | llama-server | 서버 수명 (상주) | 상주하는 작업 자리. `slot.id = i`가 부여되고 (tools/server/server-context.cpp:1072) 현재 작업/샘플러/프롬프트 캐시 상태를 가짐 |
+| **sequence** | llama | 서버 수명 (상주) | 대화 1개의 KV 스트림 (`llama_seq_id`). slot과 1:1 고정 매핑 - `slot.id`가 그대로 `seq_id`로 쓰인다 (server-context.cpp:1523) |
+| **context** (`llama_context`) | llama | 서버 수명 | 실행 엔진. 서버에 1개이며 `n_seq_max`(= 슬롯 수)개의 sequence를 수용 |
+| **session** | 디스크 | 프로세스보다 김 | **살아있는 객체가 아니라 상태 스냅샷 파일**. context 전체(`llama_state_save_file`, llama-cli `--prompt-cache`) 또는 sequence 하나(`llama_state_seq_save_file`, server `--slot-save-path`)를 직렬화한 것 (include/llama.h:773~828, 옛 이름 `llama_save_session_file`은 deprecated) |
+
+### 관계 요약
+
+- **request -> slot: 일시 배정 (N:1, 시간에 걸쳐)**. slot은 여러 request를 순차 처리하며, request가 끝나도 slot(과 그 KV)은 남는다. 같은 대화의 후속 request는 prefix가 겹치는 slot에 재배정되어 KV를 재사용한다 (`-sps, --slot-prompt-similarity` 또는 `id_slot` 명시).
+- **slot == sequence: 1:1 고정**. slot은 sequence에 서버 스케줄링 상태를 덧붙인 래퍼다.
+- **context ⊃ sequence: 수용 (1:N)**. `-np N`이 곧 `n_seq_max`.
+- **context/sequence -> session: 직렬화**. 웹 서비스 용어의 "세션(사용자 대화)"을 뜻한다면 그것은 context가 아니라 **sequence**에 대응한다.
+
+```
+request (HTTP 1회, 일시적)
+   --[배정: idle slot 또는 prefix가 비슷한 slot]-->
+slot (서버의 상주 작업 자리)  ==1:1==  sequence (KV 스트림, 대화)
+   --[N개 수용]-->
+llama_context (실행 엔진, 서버에 1개)
+   --[공유]-->
+llama_model (가중치)
+
+session file = context 상태(또는 slot/sequence 하나의 상태)의 디스크 스냅샷
+```
+
+### 구조 다이어그램
+
+```plantuml
+@startuml
+title request / slot / session / sequence / context / model 의 관계
+skinparam linetype ortho
+
+package "HTTP 계층 (일시적)" {
+  class "request\n(POST /completion 1회)" as Req {
+    prompt
+    id_slot (선택: slot 지정)
+  }
+}
+
+package "llama-server 계층 (상주)" {
+  class "slot #i\n(작업 자리)" as Slot {
+    id = i
+    현재 작업 상태
+    샘플러, 프롬프트 캐시
+  }
+}
+
+package "llama 계층 (상주)" {
+  class "sequence (seq_id = i)\n= 대화 1개의 KV 스트림" as Seq {
+    pos 0,1,2,...
+    KV 캐시 영역
+  }
+  class "llama_context\n(실행 엔진, 서버에 1개)" as Ctx {
+    n_seq_max = 슬롯 수
+    KV 캐시 풀, sched, 버퍼
+  }
+  class "llama_model\n(가중치, 읽기 전용)" as Model
+}
+
+package "디스크" {
+  class "session file\n(상태 스냅샷)" as Sess
+}
+
+Req "N개\n(시간에 걸쳐)" --> "1" Slot : 일시 배정\n(idle 또는 prefix 유사 slot,\n-sps / id_slot)
+Slot "1" -- "1" Seq : 고정 매핑\nslot.id == seq_id
+Ctx *-- "n_seq_max" Seq : 수용
+Ctx ..> Model : const & (공유, 비소유)
+
+Ctx ..> Sess : 전체 상태 저장/복원\nllama_state_save_file\n(llama-cli --prompt-cache)
+Seq ..> Sess : slot 단위 저장/복원\nllama_state_seq_save_file\n(server --slot-save-path)
+
+note bottom of Req
+  request는 일감: 처리가 끝나면 사라짐.
+  slot/sequence는 남아서 다음 request를 기다림.
+end note
+
+note bottom of Sess
+  session은 살아있는 객체가 아니라
+  context(또는 sequence 하나) 상태의
+  직렬화된 파일이다.
+end note
+@enduml
+```
+
+### 시간 축 다이어그램
+
+수명 차이가 핵심이다: request(초 단위) < slot/sequence/context(서버 수명) < session file(프로세스보다 오래 살 수 있음).
+
+```plantuml
+@startuml
+title 시간 축: slot은 상주, request는 일시 점유 (llama-server -np 2)
+
+concise "대화 A의 requests" as ReqA
+concise "대화 B/C의 requests" as ReqB
+concise "slot 0 (= seq 0)" as S0
+concise "slot 1 (= seq 1)" as S1
+
+@0
+ReqA is {hidden}
+ReqB is {hidden}
+S0 is "idle"
+S1 is "idle"
+
+@1
+ReqA is "A-req1"
+S0 is "A-req1 처리"
+
+@2
+ReqB is "B-req1"
+S1 is "B-req1 처리"
+
+@3
+ReqA is {hidden}
+S0 is "idle (A의 KV 유지)"
+
+@4
+ReqB is {hidden}
+S1 is "idle (B의 KV 유지)"
+
+@5
+ReqA is "A-req2 (후속 질문)"
+S0 is "A-req2 처리 (KV 재사용!)"
+
+@6
+ReqB is "C-req1 (새 대화)"
+S1 is "C-req1 처리 (B의 KV 밀려남)"
+
+@7
+ReqA is {hidden}
+ReqB is {hidden}
+S0 is "idle"
+S1 is "idle"
+
+highlight 5 to 6 #lightblue : 같은 대화의 후속 request는 같은 slot으로 -> prefill 절약
+highlight 6 to 7 #FFE4E1 : 다른 대화가 slot을 차지하면 기존 KV는 교체됨
+@enduml
+```
+
+@5 구간이 서버 프롬프트 캐싱의 요점이다: 대화 A의 후속 request가 같은 slot 0에 배정되면 seq 0의 KV를 재사용해 prefill을 건너뛴다. 반대로 @6처럼 새 대화 C가 slot 1을 차지하면 B의 KV는 밀려나고, B가 다시 오면 재-prefill이 필요하다 (`--cache-idle-slots`가 이 손실을 완화).
+
+---
+
 ## 핵심 요약
 
 1. **batch = 논리 단위**: `llama_decode()` 1회 제출 묶음. prefill/decode 구분 없이 여러 sequence의 토큰을 혼합할 수 있고, 그 자체로는 연산이 일어나지 않는다.
@@ -316,3 +468,4 @@ llama-batched-bench -m model.gguf -c 16384 -b 2048 -ub 512 -ngl 99 \
 4. **격리는 seq_id로**: 같은 그래프에서 함께 계산돼도 KV 슬롯과 attention mask가 sequence 간 접근을 차단하므로 결과는 개별 실행과 동일하다.
 5. **다중화는 sequence로, 격리는 context로**: 배칭 효율이 필요하면 한 context에 여러 sequence, 완전한 격리/개별 설정/스레드 병렬이 필요하면 context를 분리한다.
 6. **직접 실행해 보려면**: `-np`(`--parallel`)가 sequence 수를 결정한다. 실서비스는 `llama-server -np N`, 시뮬레이션은 `llama-parallel`, 최소 예제 코드는 `llama-batched`, 벤치마크는 `llama-batched-bench`.
+7. **서버 용어 등식은 slot == sequence 하나뿐**: request는 slot에 일시 배정되는 일감이고, session은 context/sequence 상태의 디스크 스냅샷 파일이다. 웹 서비스 의미의 "세션(대화)"은 context가 아니라 sequence에 대응한다.
