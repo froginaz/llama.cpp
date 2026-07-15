@@ -412,15 +412,24 @@ slot 레인은 "누가 일하고 있는가"(작업 자리), seq 레인은 "KV에
 @startuml
 title 시간 축: request는 일시 점유, slot/sequence/context는 상주 (llama-server -np 2)
 
+<style>
+timingDiagram {
+  .req  { BackGroundColor White;    LineColor #808080 }
+  .slot { BackGroundColor #FFF2CC;  LineColor #B8860B }
+  .seq  { BackGroundColor #EAF3FB;  LineColor #4682B4 }
+  .ctx  { BackGroundColor #ECECEC;  LineColor #696969 }
+}
+</style>
+
 scale 1 as 200 pixels
 
-concise "대화 A의 requests" as ReqA
-concise "대화 B/C의 requests" as ReqB
-concise "slot 0 (작업 자리)" as S0
-concise "seq 0 (KV 스트림)" as Q0
-concise "slot 1 (작업 자리)" as S1
-concise "seq 1 (KV 스트림)" as Q1
-concise "llama_context (실행 엔진)" as CTX
+concise "대화 A의 requests" as ReqA <<req>>
+concise "대화 B/C의 requests" as ReqB <<req>>
+concise "slot 0 (작업 자리)" as S0 <<slot>>
+concise "seq 0 (KV 스트림)" as Q0 <<seq>>
+concise "slot 1 (작업 자리)" as S1 <<slot>>
+concise "seq 1 (KV 스트림)" as Q1 <<seq>>
+concise "llama_context (실행 엔진)" as CTX <<ctx>>
 
 @0
 ReqA is {hidden}
@@ -472,7 +481,7 @@ Q1 is "C의 KV 유지" #Khaki
 highlight 5 to 6 #E8F4FF : 같은 대화의 후속 request는 같은 slot으로 -> seq 0의 KV 재사용, prefill 절약
 highlight 6 to 7 #FFE4E1 : 다른 대화가 slot을 차지하면 그 seq의 KV는 교체됨
 
-caption 색 = 대화 소속 (파랑: 대화 A, 초록: 대화 B, 노랑: 대화 C). 수명 비교: request(짧은 구간) < slot/seq/context(전 구간 상주). slot은 "누가 일하는가", seq는 "KV에 무엇이 쌓여 있는가", context는 이 모두를 담는 그릇.
+caption 상태 색 = 대화 소속 (파랑: A, 초록: B, 노랑: C) / 레인 배경 = 계층 (연노랑: slot, 연파랑: seq, 회색: context). 수명 비교: request(짧은 구간) < slot/seq/context(전 구간 상주). slot은 "누가 일하는가", seq는 "KV에 무엇이 쌓여 있는가", context는 이 모두를 담는 그릇.
 @enduml
 ```
 
