@@ -56,8 +56,8 @@ llama_context *-- buffer : buf_output (host)
 kv *-- "n" buffer : KV tensors
 sched *-- "n" buffer : compute buffers
 
-' non-owning references (dashed)
-llama_context ..> llama_model : const & (read-only,\nmust outlive context)
+' non-owning association (solid, N:1) - not composition
+llama_context "N" --> "1" llama_model : 단방향 연관 (비소유 const &)\n{model must outlive context}
 llama_model ..> "n" dev : devices[] / dev_layer[]\n(placement plan, non-owning)
 sched ..> backend : non-owning refs
 backend ..> dev : runs on

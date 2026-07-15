@@ -87,6 +87,46 @@ memory.reset(model.create_memory(params_mem, cparams));   // model이 생성, co
 
 KV 캐시 구조(통합 KV, SWA, recurrent state 등)는 아키텍처에 따라 다르므로 **model이 팩토리 메서드로 생성**하지만, KV 캐시는 시퀀스별 상태이므로 **context가 소유**한다. KV 텐서는 `model.dev_layer(il)`이 가리키는 디바이스에 할당된다 (`offload_kqv`).
 
+### UML 관계 분류: context-model은 composition이 아니다
+
+composition(채운 마름모)은 "whole이 part를 배타적으로 소유하고 생성/소멸을 책임지며, part의 수명이 whole에 종속"일 때만 성립한다. context->model은 세 요건 모두 반대다: model은 여러 context가 공유하고, context 소멸자는 model을 건드리지 않으며, 오히려 model이 context보다 오래 살아야 한다. 따라서 **N:1 단방향 연관(unidirectional association) + 수명 제약 `{model outlives context}`**이 정확한 분류다. C++ 관용구로 보면 명확하다: composition은 값 멤버/`unique_ptr` 멤버, 연관은 비소유 참조/포인터 멤버인데 context는 model을 `const &`로 보유한다.
+
+이 문서의 관계 전체를 UML 용어로 분류하면:
+
+| 관계 | UML 분류 | C++ 구현 |
+|---|---|---|
+| App -> `llama_model`, App -> `llama_context` | **composition** (API 계약상 App이 free 책임) | C API 소유권 (`llama_model_free`, `llama_free`) |
+| `llama_context` -> sched, KV(memory), backends, buf_output | **composition** | `unique_ptr`/RAII 멤버 - context가 죽으면 함께 소멸 |
+| `llama_model` -> 가중치 버퍼 | **composition** | `ggml_backend_buffer_ptr` |
+| **`llama_context` -> `llama_model`** | **단방향 연관** (N:1, `{model outlives context}`) | `const llama_model &` 비소유 참조 (src/llama-context.h:267) |
+| `llama_model` -> `ggml_backend_dev_t` | 단방향 연관 (비소유) | 전역 레지스트리 소유 핸들의 참조 |
+| `llama_model` -> `llama_memory_i` (`create_memory`) | **dependency** <<create>> (팩토리) | 생성만 하고 소유는 context에 넘김 |
+
+### context : model 조합 매트릭스 (multi-context vs multi-model)
+
+context는 `const llama_model &`로 정확히 하나의 model에 바인딩되지만 그 역은 아니다. 가능한 조합과 실제 사용사례:
+
+| 조합 | 가능? | 실제 사용사례 |
+|---|---|---|
+| 1 model : 1 context | O | llama-cli, llama-simple 등 대부분의 단순 앱 |
+| **1 model : N contexts** | O | **MTP speculative decoding, 스레드 병렬, 용도별 설정 분리** |
+| N models : 각자 context | O | 별도 draft model speculative, RAG(임베딩+생성), 멀티모달(mmproj) |
+| N models : 1 context 공유 | **X** | context가 단일 model 참조라 불가능 |
+
+**multi-context != multi-model**이라는 점이 핵심이다. 1 model : N contexts의 대표 사례가 llama-server의 MTP(Multi-Token Prediction) speculative decoding이다 (tools/server/server-context.cpp:957~968):
+
+```cpp
+// "creating MTP draft context against the target model"
+auto cparams_mtp = common_context_params_to_llama(params_base);
+cparams_mtp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+...
+ctx_dft.reset(llama_init_from_model(model_tgt, cparams_mtp));  // <- 같은 model_tgt!
+```
+
+같은 target model 하나에 일반 context(`ctx_tgt`)와 MTP context(`ctx_dft`)를 둘 다 만든다 - 같은 가중치를 공유하면서 그래프 타입/KV 타입/cparams가 다른 순수 1-model-2-context 구성이다. 그 외에 스레드 병렬(스레드마다 context, 락 없이 동시 추론), 용도별 설정 분리(채팅용 큰 `n_ctx` + 임베딩용 pooling 설정) 등이 있다.
+
+반대로 multi-model 사례(별도 draft model, RAG, 멀티모달)에서는 model마다 context가 딸려오므로 multi-context가 **결과로서** 나타난다. 즉 multi-model은 multi-context를 함의하지만, 그 반대는 성립하지 않는다.
+
 ## 3. 소유권 (Ownership) 정리표
 
 | 소유자 | 소유 대상 | 메커니즘 | 근거 |
@@ -184,8 +224,8 @@ llama_context *-- buffer : buf_output (host)
 kv *-- "n" buffer : KV tensors
 sched *-- "n" buffer : compute buffers
 
-' non-owning references (dashed)
-llama_context ..> llama_model : const & (read-only,\nmust outlive context)
+' non-owning association (solid, N:1) - not composition
+llama_context "N" --> "1" llama_model : 단방향 연관 (비소유 const &)\n{model must outlive context}
 llama_model ..> "n" dev : devices[] / dev_layer[]\n(placement plan, non-owning)
 sched ..> backend : non-owning refs
 backend ..> dev : runs on
