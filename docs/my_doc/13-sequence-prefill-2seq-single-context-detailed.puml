@@ -33,8 +33,8 @@ end note
 
 note over KV
   **사전 상태: KV 캐시가 비어 있다**
-    cell : |0 1 2 ... 8191                    |
-    소유 : |---------- 전부 비어 있음 ---------|
+  |= cell |= 소유 |= 내용 |
+  | 0 .. 8191 | - | 전부 비어 있음 |
   (레이어당 cache_k_l/v_l [1024, 8192, 1] F16는
    context 생성 시 이미 할당돼 있음 - 내용만 빈 상태)
   축 해석: [K벡터 길이(GQA, 8x128 - n_embd 아님!), 셀 수 = n_ctx, 스트림 수]
@@ -165,7 +165,10 @@ App -> App : 샘플링: seq 0 -> "The", seq 1 -> "Messi"
 note over App, M
   **prefill 종료 상태** = decode 상세 주석판
   (13-sequence-decode-batch2-single-context-detailed.puml)의 사전 상태:
-    cell : |0..6 seq0(7)|7..12 seq1(6)|13.. 비어 있음|
+  |= cell |= 소유 |= 내용 |
+  |<#E8F4FF> 0 .. 6 | seq 0 | "what is capital of france?"의 K/V (7토큰, pos 0..6) |
+  |<#FFF6D9> 7 .. 12 | seq 1 | "who is best soccer player?"의 K/V (6토큰, pos 0..5) |
+  | 13 .. 8191 | - | 비어 있음 |
   다음 llama_decode는 batch{token=[The,Messi], pos=[7,6]} - 폭 2의 decode 스텝.
 end note
 @enduml

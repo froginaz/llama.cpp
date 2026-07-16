@@ -52,8 +52,10 @@ note over KV
   (n_ctx를 반으로 줄이면 이 버퍼도 반으로: kv_size에 선형 비례)
 
   셀 사용 현황 (unified: 셀마다 seq_id 태그로 소유가 구분됨):
-    cell : |0 1 2 3 4 5 6 |7 8 9 10 11 12 |13 14 15 ... 8191|
-    소유 : |--- seq 0 ----|--- seq 1 -----|---- 비어 있음 ---|
+  |= cell |= 소유 |= 내용 |
+  |<#E8F4FF> 0 .. 6 | seq 0 | "what is capital of france?"의 K/V (7토큰, pos 0..6) |
+  |<#FFF6D9> 7 .. 12 | seq 1 | "who is best soccer player?"의 K/V (6토큰, pos 0..5) |
+  | 13 .. 8191 | - | 비어 있음 |
            "what is capital of france?"
                           "who is best soccer player?"
 end note
@@ -192,6 +194,14 @@ note right : 첫 접근에서 synchronize() -> 비동기 복사 완료 보장
 App -> App : row 0 -> seq 0의 다음 토큰 샘플링\nrow 1 -> seq 1의 다음 토큰 샘플링
 
 note over App, M
+  **decode 종료 상태**:
+  |= cell |= 소유 |= 내용 |
+  |<#E8F4FF> 0 .. 6 | seq 0 | 프롬프트의 K/V (pos 0..6) |
+  |<#FFF6D9> 7 .. 12 | seq 1 | 프롬프트의 K/V (pos 0..5) |
+  |<#E8F4FF> 13 | seq 0 | "The"의 K/V (pos 7) <- 이번 스텝에 기록 |
+  |<#FFF6D9> 14 | seq 1 | "Messi"의 K/V (pos 6) <- 이번 스텝에 기록 |
+  | 15 .. 8191 | - | 비어 있음 |
+
   **다음 스텝도 완전히 동일하다**: batch의 token id와 pos만 바뀌고
   (pos = [8, 7]), 셀은 15, 16이 배정되며, 그래프는 재사용 경로를 탄다.
   대화가 끝날 때까지 이 1스텝이 반복될 뿐이다.
