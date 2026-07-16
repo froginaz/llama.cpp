@@ -1,21 +1,6 @@
 @startuml
 title 단일 컨텍스트 decode 상세 주석판: 두 대화, batch size 2, 텐서 shape/메모리 레이아웃 포함
 
-' ============================================================
-' 예제 설정 (2장 예제의 연속):
-'   seq 0 = "what is capital of france?" -> prefill 완료 (7토큰, pos 0..6)
-'   seq 1 = "who is best soccer player?" -> prefill 완료 (6토큰, pos 0..5)
-'   이번 스텝: 직전에 샘플링된 토큰 1개씩을 decode
-'     token[0] = seq 0의 새 토큰, pos 7
-'     token[1] = seq 1의 새 토큰, pos 6
-' 가정한 모델/설정 (7B급 예시):
-'   n_embd=4096, n_layer=32, n_head=32, n_head_kv=8, d_head=128
-'   n_embd_k_gqa = n_embd_v_gqa = 8*128 = 1024, n_vocab=32000
-'   n_ctx=8192, kv_unified=true (n_stream=1), n_seq_max=2
-'   (n_ctx를 8192로 잡아 n_embd(4096)와 값이 겹치지 않게 함)
-'   n_batch=2048, n_ubatch=512, KV 타입 F16
-' ============================================================
-
 participant App
 box "llama_context 소유물" #F0F8FF
   participant "llama_context" as C
@@ -25,6 +10,16 @@ box "llama_context 소유물" #F0F8FF
   participant "ggml_backend_t\n(CUDA0 stream)" as B
 end box
 participant "llama_model\n(weights)" as M
+
+note across
+  **예제 설정** (2장 예제의 연속 - prefill 상세 주석판의 "다음 단계")
+  |= 항목 |= 내용 |
+  | seq 0 | "what is capital of france?" prefill 완료 (7토큰, pos 0..6) |
+  | seq 1 | "who is best soccer player?" prefill 완료 (6토큰, pos 0..5) |
+  | 이번 스텝 | 직전에 샘플링된 토큰 1개씩을 decode\ntoken[0] = seq 0의 새 토큰(pos 7), token[1] = seq 1의 새 토큰(pos 6) |
+  | 모델 가정 (7B급) | n_embd=4096, n_layer=32, n_head=32, n_head_kv=8, d_head=128\nn_embd_k_gqa = n_embd_v_gqa = 8x128 = 1024, n_vocab=32000 |
+  | 설정 가정 | n_ctx=8192 (n_embd와 값이 겹치지 않게 선택), kv_unified=true (n_stream=1)\nn_seq_max=2, n_batch=2048, n_ubatch=512, KV 타입 F16 |
+end note
 
 note over App
   **변수 용어 정리**
