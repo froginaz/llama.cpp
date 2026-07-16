@@ -5,6 +5,7 @@
 PlantUML 원본:
 
 - [13-sequence-decode-batch2-single-context.puml](13-sequence-decode-batch2-single-context.puml) - batch size 2 decode 상세 시퀀스 다이어그램 (단일 컨텍스트, 기본형)
+- [13-sequence-decode-batch2-single-context-detailed.puml](13-sequence-decode-batch2-single-context-detailed.puml) - 위 기본형의 상세 주석판: 두 대화 예제 연동, 함수별 역할 설명, 텐서 shape 흐름, KV 캐시 메모리 레이아웃, 변수 용어 표 포함
 - [13-sequence-decode-batch2-multi-context.puml](13-sequence-decode-batch2-multi-context.puml) - batch size 2 decode 상세 시퀀스 다이어그램 (멀티 컨텍스트)
 - [13-request-slot-session-structure.puml](13-request-slot-session-structure.puml) - request/slot/session/sequence/context 구조 다이어그램
 - [13-request-slot-timeline.puml](13-request-slot-timeline.puml) - slot 점유 시간 축 다이어그램
@@ -152,6 +153,8 @@ ctx1에 대화 1(그 안에서는 seq 0), ctx2에 대화 2(역시 자기 seq 0)�
 4. **App에서 결과 사용**: `llama_get_logits_ith(0)`, `(1)` - 첫 접근 시 `synchronize()`로 async 복사 완료를 보장. seq0/seq1 각각 샘플링해서 다음 스텝의 2토큰 배치를 다시 구성.
 
 ### 단일 컨텍스트 (기본형)
+
+더 깊이 파고들고 싶다면 [상세 주석판](13-sequence-decode-batch2-single-context-detailed.puml)을 참고하라 - 2장의 두 대화 예제를 그대로 이어받아, 모든 함수 호출의 역할(sched_reserve가 왜 no-op인지, init_batch가 KV 셀을 어떻게 찾는지), 단계별 텐서 shape(`[n_embd, 2]` -> `[n_vocab, 2]`), KV 캐시의 메모리 레이아웃(`[n_embd_k_gqa, kv_size, n_stream]`, 셀 배치도), 변수 용어 표까지 주석으로 담았다.
 
 ```plantuml
 @startuml
