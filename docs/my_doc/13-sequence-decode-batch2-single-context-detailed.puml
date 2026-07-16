@@ -144,6 +144,28 @@ alt 그래프 재사용 (can_reuse == true, 생성 루프의 통상 경로)
 else 토폴로지 변경 (첫 스텝 등)
   C -> S : ggml_backend_sched_reset()
   C -> M : build_graph(gparams)
+  note right
+    **build_graph 내부** (src/llama-model.cpp:2186 -> 04/05번 문서 참고)
+    gparams = {ubatch, cparams, mctx, 그래프 타입}
+    - 그래프 토폴로지를 유일하게 결정 (can_reuse의 비교 대상)
+
+    1. 아키텍처별 빌더 생성: build_arch_graph()
+       -> 예: llama_model_llama의 llm_graph_context
+    2. 빌더가 ggml_* 호출을 연쇄해 수식 트리를 쌓는다:
+       build_inp_embd/pos -> [레이어 x32: build_norm ->
+       build_attn(Q/K/V mul_mat + rope + KV cpy + attention)
+       -> build_ffn] -> output_norm -> lm_head
+    3. **ggml_* 호출은 계산하지 않는다** - op 태그와 src[]
+       포인터를 가진 ggml_tensor 노드를 ctx0에 만들 뿐 (lazy)
+    4. ggml_build_forward_expand()(ggml/src/ggml.c)가 트리를
+       DFS로 훑어 위상 정렬된 nodes[] = **ggml_cgraph** 완성
+       (이 배열 순서가 곧 실행 스케줄)
+
+    결과: 노드 ~2000개(레이어당 ~60 op), leaf = 가중치/입력 텐서.
+    중간 텐서의 메모리는 아직 없다 -> 아래 sched_alloc_graph가 할당.
+    t_logits 등 중요 텐서 포인터는 res(llm_graph_result)에 보관
+    -> set_inputs와 logits 추출이 이를 사용.
+  end note
   M --> C : ggml_cgraph (~2000 노드)
   C -> S : ggml_backend_sched_alloc_graph(gf)
   note right

@@ -106,6 +106,16 @@ end note
 alt 첫 pass -> 그래프 신규 빌드 (재사용 불가)
   C -> S : ggml_backend_sched_reset()
   C -> M : build_graph(gparams)
+  note right
+    **build_graph 내부** (요약 - 상세는 decode 주석판/04번 문서):
+    1. 아키텍처별 빌더(build_arch_graph)가 ggml_* 호출을 연쇄
+       (임베딩 -> 레이어 x32 -> output_norm -> lm_head)
+    2. ggml_* 호출은 계산 없이 op+src[] 노드만 쌓는 lazy 방식
+    3. ggml_build_forward_expand()가 수식 트리를 위상 정렬해
+       nodes[] 배열 = ggml_cgraph 완성 (배열 순서 = 실행 순서)
+    decode와 같은 코드가 실행된다 - ubatch.n_tokens가 13이라
+    모든 노드의 폭만 13으로 커질 뿐, 노드 수는 동일하다.
+  end note
   M --> C : ggml_cgraph (13-token 폭)
   C -> S : ggml_backend_sched_alloc_graph(gf)
   note right
