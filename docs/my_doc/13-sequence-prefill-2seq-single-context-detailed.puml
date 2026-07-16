@@ -48,12 +48,26 @@ end note
 
 App -> C : llama_decode(batch{n_tokens=13})
 note right
-  **입력 llama_batch** - 두 대화를 한 batch에 나란히:
-    i     : 0    1  2       3  4      5   6 | 7   8  9    10     11     12
-    token : what is capital of france ?     | who is best soccer player ?
-    pos   : 0    1  2       3  4      5   6 | 0   1  2    3      4      5
-    seq_id: 0    0  0       0  0      0   0 | 1   1  1    1      1      1
-    logits: 0    0  0       0  0      0   1 | 0   0  0    0      0      1
+  **입력 llama_batch** - 두 대화를 한 batch에 나란히
+  (토큰화는 예시일 뿐: 여기선 "capital"이 2조각으로 쪼개져
+   seq 0이 7토큰이 된다고 가정. 실제는 토크나이저에 따라 다름)
+
+  |= i |= token |= pos |= seq_id |= logits |
+  |<#E8F4FF> 0 | what | 0 | 0 | 0 |
+  |<#E8F4FF> 1 | is | 1 | 0 | 0 |
+  |<#E8F4FF> 2 | capi | 2 | 0 | 0 |
+  |<#E8F4FF> 3 | tal | 3 | 0 | 0 |
+  |<#E8F4FF> 4 | of | 4 | 0 | 0 |
+  |<#E8F4FF> 5 | france | 5 | 0 | 0 |
+  |<#E8F4FF> 6 | ? | 6 | 0 | **1** |
+  |<#FFF6D9> 7 | who | 0 | 1 | 0 |
+  |<#FFF6D9> 8 | is | 1 | 1 | 0 |
+  |<#FFF6D9> 9 | best | 2 | 1 | 0 |
+  |<#FFF6D9> 10 | soccer | 3 | 1 | 0 |
+  |<#FFF6D9> 11 | player | 4 | 1 | 0 |
+  |<#FFF6D9> 12 | ? | 5 | 1 | **1** |
+
+  i열 색: 파랑 = seq 0, 노랑 = seq 1 (타임라인 다이어그램의 대화 색과 동일)
   pos가 seq마다 0부터 - 이어진 한 문장이 아니라 논리적 묶음일 뿐.
   logits=1은 각 seq의 마지막 토큰(i=6, i=12)에만.
 end note
