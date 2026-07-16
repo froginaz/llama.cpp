@@ -1,0 +1,157 @@
+@startuml
+title 단일 컨텍스트 prefill 상세 주석판: 서로 다른 두 대화를 한 pass(batch 1개)로 prefill
+
+' ============================================================
+' 예제 설정 (2장 예제, decode 상세 주석판의 "이전 단계"):
+'   seq 0 = "what is capital of france?" (7토큰, pos 0..6)  <- 아직 KV 없음
+'   seq 1 = "who is best soccer player?" (6토큰, pos 0..5)  <- 아직 KV 없음
+'   이번 pass: 두 프롬프트 13토큰을 llama_decode 1회로 prefill
+'   (llama-parallel/llama-server가 동시 요청 2개를 이렇게 배칭한다)
+' 가정한 모델/설정 (decode 주석판과 동일):
+'   n_embd=4096, n_layer=32, n_head=32, n_head_kv=8, d_head=128
+'   n_embd_k_gqa = n_embd_v_gqa = 1024, n_vocab=32000
+'   n_ctx=4096, kv_unified=true (n_stream=1), n_seq_max=2
+'   n_batch=2048, n_ubatch=512, KV 타입 F16
+' ============================================================
+
+participant App
+box "llama_context 소유물" #F0F8FF
+  participant "llama_context" as C
+  participant "batch_allocr" as BA
+  participant "llama_memory_i\n(KV cache)" as KV
+  participant "ggml_backend_sched" as S
+  participant "ggml_backend_t\n(CUDA0 stream)" as B
+end box
+participant "llama_model\n(weights)" as M
+
+note over App
+  **변수 용어 정리 (prefill pass 기준)**
+  | 변수 | 의미 | 이 예제 값 |
+  | n_tokens | 이번 batch의 토큰 수 = 두 프롬프트 합 | 13 |
+  | n_batch | llama_decode 1회 최대 토큰 수 | 2048 (13 << 2048, 한 pass 가능) |
+  | n_ubatch | 그래프 1회 실행 최대 토큰 수 | 512 (13 <= 512, ubatch 1개) |
+  | n_outputs | logits를 뽑을 토큰 수 = 각 seq의 마지막만 | 2 |
+  | n_kv | attention이 읽는 KV 창 폭 | 13 -> 패딩 |
+end note
+
+note over KV
+  **사전 상태: KV 캐시가 비어 있다**
+    cell : |0 1 2 ... 4095                    |
+    소유 : |---------- 전부 비어 있음 ---------|
+  (레이어당 cache_k_l/v_l [1024, 4096, 1] F16는
+   context 생성 시 이미 할당돼 있음 - 내용만 빈 상태)
+end note
+
+App -> C : llama_decode(batch{n_tokens=13})
+note right
+  **입력 llama_batch** - 두 대화를 한 batch에 나란히:
+    i     : 0    1  2       3  4      5   6 | 7   8  9    10     11     12
+    token : what is capital of france ?     | who is best soccer player ?
+    pos   : 0    1  2       3  4      5   6 | 0   1  2    3      4      5
+    seq_id: 0    0  0       0  0      0   0 | 1   1  1    1      1      1
+    logits: 0    0  0       0  0      0   1 | 0   0  0    0      0      1
+  pos가 seq마다 0부터 - 이어진 한 문장이 아니라 논리적 묶음일 뿐.
+  logits=1은 각 seq의 마지막 토큰(i=6, i=12)에만.
+end note
+
+== 1. 배치 검증/변환 ==
+C -> BA : balloc->init(batch, vocab, memory, n_seq_max)
+note right
+  - seq 연속성 검사: 두 seq 모두 memory가 비어 있고
+    pos가 0부터 시작하므로 OK
+  - logits 플래그 집계 -> n_outputs_all = 2
+end note
+BA --> C : n_tokens_all=13, n_outputs_all=2
+C -> C : sched_reserve() -> no-op
+note right
+  컴퓨트 버퍼는 이미 worst-case(n_ubatch=512 폭)로
+  예약돼 있으므로 13토큰짜리 그래프는 그 안에 들어간다.
+end note
+C -> KV : memory_update(false) -> 할 일 없음
+
+== 2. ubatch 분할 + KV 슬롯 예약 ==
+C -> KV : memory->init_batch(balloc, n_ubatch=512)
+note right
+  - split_simple: 13 <= 512 -> **ubatch 1개** {n_tokens=13}
+    (n_ubatch=8이었다면 8토큰+5토큰 ubatch 2개 -> 그래프 2회)
+  - find_slot: 연속 빈 구간 cell 0..12를 배정 계획
+    cell 0..6  <- seq 0, pos 0..6
+    cell 7..12 <- seq 1, pos 0..5
+end note
+KV --> C : mctx (ubatch 1개 + 슬롯 계획)
+C -> C : output_reserve(2)
+note right : buf_output에 2행(2 x 32000 floats)만 확보\n(13행이 아니다 - logits=1인 토큰만 출력)
+
+== 3. ubatch 처리 (1개이므로 루프 1회) ==
+C -> KV : mctx->apply()
+note right
+  cell 0..6에 (seq 0, pos 0..6), cell 7..12에 (seq 1, pos 0..5)
+  태그 확정. head = 13. n_kv = 13을 패딩한 값.
+end note
+
+alt 첫 pass -> 그래프 신규 빌드 (재사용 불가)
+  C -> S : ggml_backend_sched_reset()
+  C -> M : build_graph(gparams)
+  M --> C : ggml_cgraph (13-token 폭)
+  C -> S : ggml_backend_sched_alloc_graph(gf)
+  note right
+    직전 그래프가 없거나 폭이 다르므로 can_reuse=false.
+    (이후 decode 스텝들에서 n_tokens=2 그래프가 새로 빌드되고,
+     그때부터는 매 스텝 재사용 경로를 탄다)
+  end note
+end
+
+C -> C : res->set_inputs(ubatch)
+note right
+  **입력 텐서** (shape 표기 [ne0, ne1, ...]):
+    inp_tokens  : I32 [13] = [what,...,?, who,...,?]
+    inp_pos     : I32 [13] = [0..6, 0..5]
+    inp_out_ids : I32 [2]  = [6, 12]  <- 출력할 행 인덱스
+    KQ_mask     : F32 [n_kv, 13(패딩)]
+      = **causal(자기 seq의 과거만) + seq 격리** 동시 적용:
+      row(i=3, seq0 pos3) : cell 0..3 = 0, 나머지 -inf
+      row(i=6, seq0 pos6) : cell 0..6 = 0, 나머지 -inf
+      row(i=9, seq1 pos2) : cell 7..9 = 0, 나머지 -inf
+      -> seq0 토큰은 cell 7..12(seq1)를 절대 못 본다
+end note
+
+C -> S : graph_compute(gf, batched=true)
+S -> B : split별 비동기 실행
+note right
+  **텐서 shape 흐름 - decode와 같은 그래프, 폭만 13**:
+  tok_embd get_rows      -> [4096, 13]
+  레이어 l = 0..31:
+    Q = wq x cur         -> [4096, 13] -> [128, 32, 13]
+    K = wk x cur         -> [1024, 13] -> [128, 8, 13]
+    V = wv x cur         -> [1024, 13]
+    K,V 13개를 cell 0..12에 기록(cpy)
+    attention            -> scores [n_kv, 13, 32]
+                         -> out [4096, 13]
+    FFN                  -> [11008, 13] -> [4096, 13]
+  output_norm            -> [4096, 13]
+  get_rows([6,12])       -> [4096, 2]   <- **여기서 13->2로 축소**
+  lm_head                -> t_logits [32000, 2]
+  (lm_head를 2행만 계산 - 11개 중간 토큰의 logits는 아예 안 만든다)
+
+  decode(폭 2)와의 차이: 같은 구조에서 폭이 13이라
+  mul_mat들이 커져 **compute-bound** 성향
+  (decode 폭 1~2는 가중치 읽기가 지배하는 memory-bound)
+end note
+B -> M : 가중치 읽기 (13토큰이 1회 읽기를 공유 = 배칭 효과)
+B -> KV : cell 0..12에 K/V 기록
+S --> C : GGML_STATUS_SUCCESS
+C -> C : tensor_get_async(t_logits)\n-> buf_output [2 x 32000] floats
+
+== 4. 결과: 여기서 decode 상세 주석판으로 이어진다 ==
+C --> App : return 0
+App -> C : llama_get_logits_ith(0) -> seq 0의 다음 토큰 분포
+App -> C : llama_get_logits_ith(1) -> seq 1의 다음 토큰 분포
+App -> App : 샘플링: seq 0 -> "The", seq 1 -> "Messi"
+
+note over App, M
+  **prefill 종료 상태** = decode 상세 주석판
+  (13-sequence-decode-batch2-single-context-detailed.puml)의 사전 상태:
+    cell : |0..6 seq0(7)|7..12 seq1(6)|13.. 비어 있음|
+  다음 llama_decode는 batch{token=[The,Messi], pos=[7,6]} - 폭 2의 decode 스텝.
+end note
+@enduml
