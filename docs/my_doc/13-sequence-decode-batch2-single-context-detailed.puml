@@ -11,7 +11,8 @@ title 단일 컨텍스트 decode 상세 주석판: 두 대화, batch size 2, 텐
 ' 가정한 모델/설정 (7B급 예시):
 '   n_embd=4096, n_layer=32, n_head=32, n_head_kv=8, d_head=128
 '   n_embd_k_gqa = n_embd_v_gqa = 8*128 = 1024, n_vocab=32000
-'   n_ctx=4096, kv_unified=true (n_stream=1), n_seq_max=2
+'   n_ctx=8192, kv_unified=true (n_stream=1), n_seq_max=2
+'   (n_ctx를 8192로 잡아 n_embd(4096)와 값이 겹치지 않게 함)
 '   n_batch=2048, n_ubatch=512, KV 타입 F16
 ' ============================================================
 
@@ -31,7 +32,7 @@ note over App
   | n_tokens | 이번 batch의 토큰 수 (논리) | 2 |
   | n_batch | llama_decode 1회 최대 토큰 수 (논리 한도) | 2048 |
   | n_ubatch | 그래프 1회 실행 최대 토큰 수 (물리 한도) | 512 |
-  | n_ctx | KV 캐시 셀 수 = attention이 기억할 수 있는 총량 | 4096 |
+  | n_ctx | KV 캐시 셀 수 = attention이 기억할 수 있는 총량 | 8192 |
   | n_seq_max | 이 context가 수용하는 sequence 수 | 2 |
   | n_outputs | 이번 스텝에 logits를 뽑을 토큰 수 | 2 |
   | n_kv | 이번 그래프에서 attention이 읽는 KV 창 폭 (패딩 포함) | 15 -> 패딩 |
@@ -40,13 +41,23 @@ end note
 note over KV
   **사전 상태: KV 캐시 메모리 레이아웃** (unified, n_stream=1)
   레이어당 텐서 (llama-kv-cache.cpp:211):
-    cache_k_l{il} : shape [n_embd_k_gqa=1024, kv_size=4096, n_stream=1], F16
-    cache_v_l{il} : shape [n_embd_v_gqa=1024, kv_size=4096, n_stream=1], F16
-  크기 = 1024 x 4096 x 2B = 8 MiB/레이어 -> K+V x 32레이어 = **512 MiB**
+    cache_k_l{il} : shape [n_embd_k_gqa=1024, kv_size=8192, n_stream=1], F16
+    cache_v_l{il} : shape [n_embd_v_gqa=1024, kv_size=8192, n_stream=1], F16
+
+  **축 해석** (ggml ne 순서: ne0이 메모리 연속 차원):
+    ne0=1024 : 토큰 1개의 K 벡터 길이 = n_head_kv(8) x d_head(128)
+               <- GQA 축소 폭. n_embd(4096)가 아니다!
+               (MHA였다면 32x128=4096이 됐을 것 - GQA 절감 효과)
+    ne1=8192 : 셀 수 = n_ctx <- "max_seq_len"에 해당하는 축
+    ne2=1    : 스트림 수 (unified=1, 비통합이면 n_seq_max)
+  즉 [K벡터 길이, 셀 수, 스트림] - row-major 표기로 뒤집으면
+  [n_stream, kv_size, n_embd_k_gqa]
+
+  크기 = 1024 x 8192 x 2B = 16 MiB/레이어 -> K+V x 32레이어 = **1 GiB**
   (n_ctx를 반으로 줄이면 이 버퍼도 반으로: kv_size에 선형 비례)
 
   셀 사용 현황 (unified: 셀마다 seq_id 태그로 소유가 구분됨):
-    cell : |0 1 2 3 4 5 6 |7 8 9 10 11 12 |13 14 15 ... 4095|
+    cell : |0 1 2 3 4 5 6 |7 8 9 10 11 12 |13 14 15 ... 8191|
     소유 : |--- seq 0 ----|--- seq 1 -----|---- 비어 있음 ---|
            "what is capital of france?"
                           "who is best soccer player?"

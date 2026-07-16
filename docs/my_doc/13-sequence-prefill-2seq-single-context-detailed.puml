@@ -10,7 +10,8 @@ title 단일 컨텍스트 prefill 상세 주석판: 서로 다른 두 대화를 
 ' 가정한 모델/설정 (decode 주석판과 동일):
 '   n_embd=4096, n_layer=32, n_head=32, n_head_kv=8, d_head=128
 '   n_embd_k_gqa = n_embd_v_gqa = 1024, n_vocab=32000
-'   n_ctx=4096, kv_unified=true (n_stream=1), n_seq_max=2
+'   n_ctx=8192, kv_unified=true (n_stream=1), n_seq_max=2
+'   (n_ctx를 8192로 잡아 n_embd(4096)와 값이 겹치지 않게 함)
 '   n_batch=2048, n_ubatch=512, KV 타입 F16
 ' ============================================================
 
@@ -36,10 +37,13 @@ end note
 
 note over KV
   **사전 상태: KV 캐시가 비어 있다**
-    cell : |0 1 2 ... 4095                    |
+    cell : |0 1 2 ... 8191                    |
     소유 : |---------- 전부 비어 있음 ---------|
-  (레이어당 cache_k_l/v_l [1024, 4096, 1] F16는
+  (레이어당 cache_k_l/v_l [1024, 8192, 1] F16는
    context 생성 시 이미 할당돼 있음 - 내용만 빈 상태)
+  축 해석: [K벡터 길이(GQA, 8x128 - n_embd 아님!), 셀 수 = n_ctx, 스트림 수]
+  - 상세는 decode 주석판(13-sequence-decode-batch2-single-context-detailed.puml)의
+    "축 해석" 노트 참고
 end note
 
 App -> C : llama_decode(batch{n_tokens=13})
