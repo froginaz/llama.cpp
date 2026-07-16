@@ -147,6 +147,8 @@ Walking the stages in execution order:
 
 ### Appendix diagrams & cross-runtime notes
 
+- [00-handoff-npu-backend.md](00-handoff-npu-backend.md) — onboarding entry point for external collaborators (NPU backend work): reading order, code entry points, conventions, and a validated one-way git-bundle transfer recipe (Korean).
+
 - [09-sequence-gguf-to-cgraph.wsd](09-sequence-gguf-to-cgraph.wsd) — PlantUML sequence: GGUF + per-arch C++ ⇒ `ggml_cgraph`.
 - [10-llama-model-class-diagram.wsd](10-llama-model-class-diagram.wsd) — PlantUML class diagram of `src/llama-model.h`.
 - [11-hw-backend-abstraction.md](11-hw-backend-abstraction.md) — abstracting one HW accelerator across **llama.cpp / ggml, ONNX Runtime, and ExecuTorch** backend APIs (entry points, comparison, a common `hwaccel.h`).
