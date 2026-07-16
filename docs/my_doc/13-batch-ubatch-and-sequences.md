@@ -380,7 +380,9 @@ llama-parallel -m model.gguf -np 8 -ns 128 --top-k 1 -pps --junk 10 -c 16384
 llama-batched -m model.gguf -p "Hello my name is" -np 4 --kv-unified
 ```
 
-프롬프트를 seq 0으로 1회 prefill -> `llama_memory_seq_cp`로 KV를 seq 1..3에 복사 -> 매 스텝 `n_tokens=4` batch로 4개 시퀀스가 동시에 생성된다. 소스(examples/batched/batched.cpp:120~)가 `llama_batch`에 seq_id를 직접 채우는 가장 작은 교과서 코드라, [2장](#2-예제로-보는-context-vs-sequence와-논리물리-배치) 예제를 코드로 확인하기 좋다. [3장](#3-decode-상세-batch-size-2가-처리되는-과정)의 batch size 2 다이어그램은 `llama-batched -np 2`의 매 스텝과 정확히 일치한다.
+**하나의 공유 프롬프트**에서 N개의 생성을 갈라낸다: prefill 시 프롬프트의 각 토큰을 `seq_ids = [0..N-1]` **전부에 태깅**해 1회만 계산하고(복사 없는 prefix 공유, examples/batched/batched.cpp:122~130; KV를 seq_cp로 복사하던 옛 방식은 주석 처리됨, batched.cpp:156~160), 이후 매 스텝 `n_tokens=N` batch로 N개 시퀀스가 동시에 생성된다. `llama_batch`에 seq_id를 직접 채우는 가장 작은 교과서 코드다.
+
+[3장](#3-decode-상세-batch-size-2가-처리되는-과정)의 batch size 2 다이어그램과의 관계에는 주의가 필요하다: **decode 스텝 구간은 정확히 일치**하지만(seq당 1토큰, logits=1, EOG 시 batch 축소까지), **prefill 전제가 다르다**. 3장 상세 주석판은 "서로 다른 두 프롬프트가 각자 prefill된 상태"(2장 예제)를 가정하는 반면, llama-batched는 공유 프롬프트 1개다. 첫 스텝의 샘플링도 다르다 - llama-batched는 모든 seq가 같은 logits 행(공유 프롬프트의 마지막 토큰)에서 샘플링하고 샘플러 시드 차이로 스트림이 갈라진다.
 
 ### llama-batched-bench - 성능 측정
 
@@ -390,6 +392,27 @@ llama-batched-bench -m model.gguf -c 16384 -b 2048 -ub 512 -ngl 99 \
 ```
 
 `-npl` = 동시 sequence 수를 1~32로 바꿔가며 PP(prefill)/TG(generation) 처리량을 측정한다. sequence 수에 따른 배칭 효율 변화를 수치로 보고 싶을 때 사용한다 (tools/batched-bench).
+
+### 서로 다른 대화들의 prefill을 한 pass로 배칭하는 도구
+
+"-np N으로 N개 sequence를 돌린다"는 점은 위 도구들이 같지만, **서로 다른 프롬프트들의 prefill이 하나의 batch(한 pass)에 함께 담기는지**는 도구마다 다르다:
+
+| Executable | 서로 다른 대화의 prefill이 한 pass에? |
+|---|---|
+| **llama-parallel** | **O** - 이 시나리오의 최소 재현체 |
+| **llama-server** | **O** - 실서비스 버전 (동시 도착한 요청들의 프롬프트 조각을 한 batch에 packing) |
+| llama-batched | X - 프롬프트가 하나뿐 (모든 seq가 공유 태깅) |
+| llama-batched-bench | 부분적 - 시퀀스별 독립 KV로 prefill을 배칭하지만 프롬프트 **내용**이 같아 "서로 다른 대화"는 아님 |
+
+llama-parallel의 메커니즘 (examples/parallel/parallel.cpp): 메인 루프의 매 반복에서 하나의 `llama_batch`에 (1) **진행 중인 클라이언트들의 생성 토큰** 1개씩(parallel.cpp:299)과 (2) **새로 시작하는 클라이언트들의 프롬프트 전체**를 각자의 seq_id로(parallel.cpp:351~353) 함께 담는다. 같은 반복에서 클라이언트 2명이 시작하면 서로 다른 두 프롬프트가 한 batch에 나란히 들어간다 - [2장](#2-예제로-보는-context-vs-sequence와-논리물리-배치) 예제(13토큰 한 batch)와 [prefill 상세 주석판](13-sequence-prefill-2seq-single-context-detailed.puml)이 정확히 이 상황이다. 이후 `n_batch` 단위 chunk로 `llama_decode`가 호출되고(parallel.cpp:385~) 내부에서 다시 ubatch로 쪼개진다.
+
+```bash
+llama-parallel -m model.gguf -np 2 -ns 2 -c 8192
+# continuous batching(기본 활성)으로 두 클라이언트가 같은 반복에서 시작하면
+# 서로 다른 프롬프트 2개가 한 batch로 prefill됨
+```
+
+캐비앳: llama-server는 스케줄링 정책(대기 요청 수, n_batch 여유, defer 정책)에 따라 프롬프트 처리가 여러 반복으로 나뉠 수 있어 "항상 한 pass"가 보장되지는 않는다. 결정적으로 재현·관찰하려면 llama-parallel이 쉽다 (클라이언트 시작 로그와 batch 크기가 같이 찍힘).
 
 ### 참고: speculative / lookahead
 
