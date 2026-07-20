@@ -63,6 +63,7 @@ par 스레드 A: ctx1 decode 상세
     S1 -> B1 : split별 비동기 실행 (ctx1 전용 스트림)
     B1 -> M : 가중치 읽기 (모든 context 공유)
     B1 -> KV1 : seq0, seq1의 K/V를 각자 슬롯에 기록\n+ attention에서 과거 KV 읽기
+    note right : K/V 기록은 그래프 안의 set_rows 노드로\ngraph_compute 중에 실행 - 매 스텝 셀 누적(stack)
     S1 --> C1 : GGML_STATUS_SUCCESS
     C1 -> C1 : logits 추출: tensor_get_async\n-> buf_output #1 [2 x n_vocab]
   end

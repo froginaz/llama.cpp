@@ -162,7 +162,12 @@ note right
   (decode 폭 1~2는 가중치 읽기가 지배하는 memory-bound)
 end note
 B -> M : 가중치 읽기 (13토큰이 1회 읽기를 공유 = 배칭 효과)
-B -> KV : cell 0..12에 K/V 기록
+B -> KV : **K/V append**: 레이어마다 13토큰의 K/V를\ncell 0..12에 기록 (set_rows 노드)
+note over KV
+  KV update는 그래프 안의 set_rows 노드가 graph_compute 중에
+  수행한다 (별도 host 호출 없음). 이 pass로 사용 셀 0 -> 13.
+  이후 decode 스텝마다 2셀씩 누적된다 (13 -> 15 -> 17 ...).
+end note
 S --> C : GGML_STATUS_SUCCESS
 C -> C : tensor_get_async(t_logits)\n-> buf_output [2 x 32000] floats
 

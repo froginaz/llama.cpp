@@ -243,7 +243,15 @@ note right
   lm_head (output 행렬)  -> **t_logits [n_vocab=32000, 2]**
 end note
 B -> M : 가중치 읽기 (mul_mat의 한쪽 입력)
-B -> KV : cell 13,14에 K/V 기록 + cell 0..14 읽기
+B -> KV : **K/V append**: 레이어마다 새 K/V를\ncell 13,14에 기록 (set_rows 노드)\n+ attention이 cell 0..14 읽기
+note over KV
+  **KV update는 별도 host 호출이 아니라 그래프 안의 노드다**:
+  build_attn이 그래프에 넣어 둔 set_rows/cpy 노드가
+  graph_compute 중에 실행되며 캐시 텐서를 직접 갱신한다.
+  매 스텝 이 노드가 실행되어 셀이 누적(stack)된다:
+    사용 셀  이번 스텝 13 -> 15,  다음 스텝 15 -> 17, ...
+  (32개 레이어의 cache_k_l/v_l 모두에 같은 셀 위치로 기록)
+end note
 S --> C : GGML_STATUS_SUCCESS
 C -> C : tensor_get_async(t_logits)\n-> buf_output [2 x 32000] floats
 
