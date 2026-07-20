@@ -48,8 +48,22 @@ note over KV
   즉 [K벡터 길이, 셀 수, 스트림] - row-major 표기로 뒤집으면
   [n_stream, kv_size, n_embd_k_gqa]
 
-  크기 = 1024 x 8192 x 2B = 16 MiB/레이어 -> K+V x 32레이어 = **1 GiB**
-  (n_ctx를 반으로 줄이면 이 버퍼도 반으로: kv_size에 선형 비례)
+  **크기 계산 (단계별)**:
+    토큰 1개/레이어 1개의 K = 1024 x 2B = 2 KB   (V 동일 -> K+V 4 KB)
+    레이어 1개의 K 텐서     = 1024 x 8192 x 2B = 16 MiB   (V 동일 -> 32 MiB)
+    모델 전체               = 32 MiB x 32레이어 = **1 GiB**
+    교차 검증 (토큰 방향):  4 KB x 32레이어 = **128 KB/토큰**
+                            x 8192토큰(n_ctx) = 1 GiB (일치)
+    -> "토큰당 128 KB"로 암산 가능: 대화 1000토큰 = KV ~125 MB
+
+  일반식: 2(K,V) x n_layer x n_ctx x (n_head_kv x d_head) x type_size
+  |= 손잡이 |= 변경 |= 결과 (기준 1 GiB) |
+  | GQA -> MHA | n_head_kv 8 -> 32 | 4 GiB (GQA가 아끼던 몫) |
+  | GQA -> MQA | n_head_kv 8 -> 1 | 128 MiB |
+  | n_ctx 축소 | 8192 -> 4096 | 512 MiB (선형 비례) |
+  | K/V 양자화 | F16 -> Q8_0 (-ctk/-ctv) | ~0.53 GiB (2B -> ~1.06B/원소) |
+  예외: MLA(latent 압축 저장, V 텐서 없음 - has_v = !is_mla),
+        SWA 레이어(kv_size = 윈도우 크기), 비통합 KV(ne1/ne2 재배치, 총량 동일)
 
   셀 사용 현황 (unified: 셀마다 seq_id 태그로 소유가 구분됨):
   |= cell |= 소유 |= 내용 |
