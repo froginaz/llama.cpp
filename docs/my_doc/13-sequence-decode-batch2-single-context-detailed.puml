@@ -43,10 +43,23 @@ note over KV
     ne0=1024 : 토큰 1개의 K 벡터 길이 = n_head_kv(8) x d_head(128)
                <- GQA 축소 폭. n_embd(4096)가 아니다!
                (MHA였다면 32x128=4096이 됐을 것 - GQA 절감 효과)
-    ne1=8192 : 셀 수 = n_ctx <- "max_seq_len"에 해당하는 축
+    ne1=8192 : 셀 수 = n_ctx (런타임 KV 용량 - 모델의 학습 한계는
+               n_ctx_train, 시퀀스 1개의 상한은 n_ctx_seq)
     ne2=1    : 스트림 수 (unified=1, 비통합이면 n_seq_max)
   즉 [K벡터 길이, 셀 수, 스트림] - row-major 표기로 뒤집으면
   [n_stream, kv_size, n_embd_k_gqa]
+
+  **축 선택의 원리** (접근 패턴에서 역산된 설계):
+    ne0=벡터 길이 : 쓰기 = 토큰 1개의 K가 연속 행 1개로 기록되고
+                    (ggml_set_rows, 셀 = 행), 읽기 = mul_mat의
+                    내적 축(K^T x Q)이 연속이 되어 전치/복사 불필요
+    ne1=셀 수     : 사용 중인 창 [d, n_kv]를 zero-copy view로
+                    슬라이스 (셀 i의 주소 = i x nb[1])
+    ne2=스트림    : 시퀀스 그룹 = 최외곽 연속 블록 -> per-seq
+                    삭제/저장/스트림 병합(reshape)이 복사 없이 가능
+    반례가 원리를 증명: FA 미사용 시 V만 전치 저장(v_trans)
+    - scores x V의 내적 축이 n_kv이기 때문. 레이아웃은 그것을
+    소비하는 커널의 내적 축을 따른다 (llama-kv-cache.cpp:1256~1291)
 
   **크기 계산 (단계별)**:
     토큰 1개/레이어 1개의 K = 1024 x 2B = 2 KB   (V 동일 -> K+V 4 KB)
