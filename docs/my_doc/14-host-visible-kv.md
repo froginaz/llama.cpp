@@ -5,6 +5,7 @@ firmware가 내부적으로 관리하던 KV 캐시를 llama.cpp(host)가 관리�
 PlantUML 원본:
 
 - [14-host-visible-kv-decode.puml](14-host-visible-kv-decode.puml) - host-visible KV에서의 decode 1스텝 시퀀스 다이어그램
+- [14-host-visible-kv-pcie.puml](14-host-visible-kv-pcie.puml) - 공유 메모리 없는 PCIe 분리 구성에서의 데이터 이동 시퀀스 다이어그램
 
 ---
 
@@ -148,7 +149,105 @@ end note
 @enduml
 ```
 
-## 6. 무엇이 열리는가 (기능 해금 목록)
+## 6. PCIe 분리 메모리 구성: "visible"은 "매핑"이 아니다
+
+host와 NPU 사이에 공유 메모리가 없고 모든 데이터가 PCIe로 오가는 구성에서도 host-visible KV는 그대로 성립한다. 핵심은 용어의 정확한 의미다:
+
+> **host-visible = host가 버퍼 API(`set_tensor`/`get_tensor`)로 접근 가능하다는 뜻이지, host 주소공간에 매핑(mmap)된다는 뜻이 아니다.**
+
+이것은 특수 케이스가 아니라 **ggml-backend의 표준 모델**이다. CUDA dGPU가 정확히 이 구성으로 동작한다: KV는 VRAM에 상주하고, host는 `cudaMemcpy`(= 버퍼 iface의 set/get_tensor)로만 접근하며, 정상 decode 경로에서 KV는 PCIe를 건너지 않는다. dNPU도 같은 자리에 서면 된다.
+
+### 연산별 PCIe 트래픽
+
+| 연산 | PCIe 트래픽 | 빈도 |
+|---|---|---|
+| 가중치 업로드 | 수 GB | 모델 로드 시 1회 |
+| KV 텐서 할당 | **0** (영역 예약만) | context 생성 시 1회 |
+| `register_kv_region` | ~KB (디스크립터) | context 생성 시 1회 |
+| decode 입력 (tokens/pos/idxs/**KQ_mask**) | 수십 KB | 매 스텝 |
+| logits 회수 | n_vocab x n_outputs x 4B (토큰당 ~128 KB) | 매 스텝 |
+| **attention의 KV 읽기/쓰기** | **0 (보드 내부)** | - |
+| `seq_rm`/`seq_cp`(unified)/shift (장부 연산) | **0** | - |
+| defrag 셀 이동 | **0** (device-to-device 복사) | 드묾 |
+| session save/restore | 시퀀스 KV 크기 (MB급) | 요청 시에만 |
+
+표가 보여주는 설계의 핵심: **정상 상태(steady-state) decode에서 GB급 KV는 절대 PCIe를 건너지 않는다.** 매 스텝 오가는 것은 메타데이터(입력)와 logits뿐이고, 이것이 2장의 "과거는 데이터로 전달되지 않는다" 원칙의 물리적 배당이다. mask-only 격리 덕분에 `seq_rm` 같은 장부 연산은 디바이스에 알릴 필요조차 없다 - 다음 forward의 mask/idxs에 자연히 반영된다.
+
+### 성능 고려사항
+
+- **왕복 지연**: 스텝당 PCIe 왕복이 고정 비용으로 붙는다 (수십 us). decode는 지연에 민감하므로 입력들을 **커맨드 하나로 묶어** 1왕복으로 만들고, **pinned host buffer**를 쓴다 - llama.cpp가 CPU 중간 버퍼에 디바이스의 host buffer type을 쓰는 기존 관행(`ggml_backend_dev_host_buffer_type`, src/llama-context.cpp:324~330)과 같은 패턴이다.
+- **KQ_mask 크기**: `[n_kv, n_tokens]` F32라서 n_kv=8192, 2토큰이면 스텝당 64 KB - n_kv가 커지면 입력 전송의 지배 항이 된다. 최적화 옵션은 mask를 F16으로 보내거나, 시퀀스별 유효 구간 서술자만 보내 device 측에서 mask를 생성하는 것이다. 단 후자는 stock 의미론과의 동일성 검증(parity 테스트)이 반드시 필요한 이탈이다.
+- **session save의 부분 읽기**: `get_tensor`는 오프셋/크기 지정이 가능하므로 시퀀스 하나의 셀 구간만 DMA하면 된다 - 전체 KV를 덤프할 필요 없다.
+
+### 시퀀스 다이어그램
+
+```plantuml
+@startuml
+title host-visible KV over PCIe: 공유 메모리 없는 분리 구성
+
+participant App
+box "host (llama.cpp)" #F0F8FF
+  participant "llama_context" as C
+  participant "llama_memory_i\n(셀 장부, host RAM)" as MEM
+  participant "NPU backend\n(driver, host측)" as B
+end box
+participant "<<PCIe>>" as P
+box "NPU 보드" #FFF7E0
+  participant "NPU firmware" as FW
+  participant "NPU DRAM\n(weights + KV 상주)" as DRAM
+end box
+
+== 0. 로드/생성 시 1회 ==
+C -> B : 가중치 업로드 (GGUF 텐서)
+B -> P : DMA host -> device (수 GB, 1회)
+P -> DRAM : weights 상주
+C -> B : KV 텐서 할당 (NPU buft)
+B -> DRAM : 영역 예약만 (데이터 전송 없음)
+C -> B : register_kv_region x 32레이어\n(디스크립터만, ~KB)
+
+== 1. decode 스텝 - 정상 경로: KV는 PCIe를 건너지 않는다 ==
+App -> C : llama_decode(batch{n_tokens=2})
+C -> MEM : find_slot/apply\n(host 장부만 갱신)
+C -> B : forward 커맨드: tokens, pos,\nk_idxs=[13,14], v_idxs, n_kv, KQ_mask
+B -> P : 커맨드 + 입력 DMA\n(수십 KB, pinned host buffer)
+P -> FW : doorbell
+FW -> DRAM : 새 K/V를 cell 13,14 행에 기록\n(보드 내부 - PCIe 무관)
+FW -> DRAM : 창 [0..n_kv) 읽기 + mask 격리\n(보드 내부 - PCIe 무관)
+FW -> P : logits DMA device -> host\n(n_vocab x 2 = ~256 KB)
+P -> B : 수신 (pinned host buffer)
+B --> C : logits
+C --> App : 샘플링 -> 다음 스텝
+
+note over P
+  스텝당 PCIe 왕복: 입력 수십 KB + logits ~256 KB.
+  KV 자체(GB급)는 NPU DRAM에 상주하며 절대 건너지 않는다.
+end note
+
+== 2. 장부 연산 - PCIe 트래픽 0 ==
+App -> C : seq_rm(rollback) / seq_cp(unified) / shift
+C -> MEM : host 장부만 수정
+note right of MEM
+  mask-only 격리 덕분에 디바이스에 알릴 것이 없다.
+  다음 forward의 KQ_mask/idxs에 자연히 반영된다.
+end note
+
+== 3. 예외 경로 (드묾) - KV가 PCIe를 건너는 유일한 경우 ==
+App -> C : llama_state_seq_save_file(seq1)
+C -> B : get_tensor(해당 셀 구간)
+B -> P : device -> host DMA (MB급, 요청 시에만)
+App -> C : llama_state_seq_set_data (restore)
+C -> B : set_tensor
+B -> P : host -> device DMA
+note right of FW
+  defrag/셀 이동은 보드 내 device-to-device
+  복사(그래프의 cpy 노드)로 처리 - 역시 PCIe 무관.
+  firmware는 forward 사이의 이런 외부 DMA를
+  용인해야 한다 (계약 불변식 5).
+end note
+@enduml
+```
+
+## 7. 무엇이 열리는가 (기능 해금 목록)
 
 visible KV가 완성되면 13번 문서 5장의 기능들이 **firmware 추가 변경 없이** 열린다:
 
@@ -162,9 +261,9 @@ visible KV가 완성되면 13번 문서 5장의 기능들이 **firmware 추가 �
 
 마지막 행이 중요하다: visible KV만으로는 멀티 시퀀스가 완성되지 않는다. NPU forward API가 토큰별 seq 소속을 표현할 수 있어야 하는데, 다행히 **firmware는 seq_id를 알 필요가 없다** - host가 seq 정보를 이미 KQ_mask와 idxs에 구워 넣어 주기 때문이다. 즉 batch API 확장의 실체는 "여러 seq의 토큰이 섞인 ubatch를 받아들이는 것"뿐이고, 격리는 mask가 처리한다.
 
-## 7. 검증 전략
+## 8. 검증 전략
 
-구현 순서대로 통과해야 할 관문 (상세 절차는 핸드오프 5.2절 M4):
+구현 순서대로 통과해야 할 관문 (상세 절차는 핸드오프 5.2절 M4). PCIe 구성에서는 5번 앞에 "스텝당 PCIe 트래픽이 6장 표와 일치하는지"(특히 KV가 새어 나가지 않는지) 프로파일링을 추가할 것:
 
 1. **logit parity**: 고정 프롬프트에서 CPU backend와 상대 오차 ~1e-2 (F16) 이내
 2. **rollback 결정성**: N토큰 decode -> `seq_rm`으로 꼬리 제거 -> 재-decode 결과가 처음부터 다시 돈 것과 완전 일치. **이 테스트 하나가 "노드가 순수해졌는가"를 판정한다**
@@ -180,3 +279,4 @@ visible KV가 완성되면 13번 문서 5장의 기능들이 **firmware 추가 �
 4. **계약의 함정 두 가지**: seq_rm은 셀을 지우지 않는다(mask-only 격리), idxs는 비연속일 수 있다(append 가정 금지).
 5. **GGML_MAX_SRC=10** 때문에 단일 노드 구조에서는 캐시 64개를 디스크립터 테이블(`register_kv_region`)로 1회 등록하고, 그래프에는 메타데이터만 흘린다.
 6. **rollback 결정성 테스트가 성공 판정 기준**: 이것이 통과하면 speculative/seq_cp/session이 원리적으로 전부 열린 것이다.
+7. **공유 메모리는 필요 없다 (visible != mapped)**: PCIe 분리 구성에서도 KV는 NPU DRAM에 상주하고, 정상 decode에서 PCIe를 오가는 것은 메타데이터(수십 KB)와 logits뿐이다. CUDA dGPU가 이미 이 모델로 동작한다 - 장부 연산은 트래픽 0, session save/restore만 예외적으로 KV를 DMA한다.

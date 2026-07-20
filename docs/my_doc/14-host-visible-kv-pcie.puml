@@ -1,0 +1,63 @@
+@startuml
+title host-visible KV over PCIe: 공유 메모리 없는 분리 구성
+
+participant App
+box "host (llama.cpp)" #F0F8FF
+  participant "llama_context" as C
+  participant "llama_memory_i\n(셀 장부, host RAM)" as MEM
+  participant "NPU backend\n(driver, host측)" as B
+end box
+participant "<<PCIe>>" as P
+box "NPU 보드" #FFF7E0
+  participant "NPU firmware" as FW
+  participant "NPU DRAM\n(weights + KV 상주)" as DRAM
+end box
+
+== 0. 로드/생성 시 1회 ==
+C -> B : 가중치 업로드 (GGUF 텐서)
+B -> P : DMA host -> device (수 GB, 1회)
+P -> DRAM : weights 상주
+C -> B : KV 텐서 할당 (NPU buft)
+B -> DRAM : 영역 예약만 (데이터 전송 없음)
+C -> B : register_kv_region x 32레이어\n(디스크립터만, ~KB)
+
+== 1. decode 스텝 - 정상 경로: KV는 PCIe를 건너지 않는다 ==
+App -> C : llama_decode(batch{n_tokens=2})
+C -> MEM : find_slot/apply\n(host 장부만 갱신)
+C -> B : forward 커맨드: tokens, pos,\nk_idxs=[13,14], v_idxs, n_kv, KQ_mask
+B -> P : 커맨드 + 입력 DMA\n(수십 KB, pinned host buffer)
+P -> FW : doorbell
+FW -> DRAM : 새 K/V를 cell 13,14 행에 기록\n(보드 내부 - PCIe 무관)
+FW -> DRAM : 창 [0..n_kv) 읽기 + mask 격리\n(보드 내부 - PCIe 무관)
+FW -> P : logits DMA device -> host\n(n_vocab x 2 = ~256 KB)
+P -> B : 수신 (pinned host buffer)
+B --> C : logits
+C --> App : 샘플링 -> 다음 스텝
+
+note over P
+  스텝당 PCIe 왕복: 입력 수십 KB + logits ~256 KB.
+  KV 자체(GB급)는 NPU DRAM에 상주하며 절대 건너지 않는다.
+end note
+
+== 2. 장부 연산 - PCIe 트래픽 0 ==
+App -> C : seq_rm(rollback) / seq_cp(unified) / shift
+C -> MEM : host 장부만 수정
+note right of MEM
+  mask-only 격리 덕분에 디바이스에 알릴 것이 없다.
+  다음 forward의 KQ_mask/idxs에 자연히 반영된다.
+end note
+
+== 3. 예외 경로 (드묾) - KV가 PCIe를 건너는 유일한 경우 ==
+App -> C : llama_state_seq_save_file(seq1)
+C -> B : get_tensor(해당 셀 구간)
+B -> P : device -> host DMA (MB급, 요청 시에만)
+App -> C : llama_state_seq_set_data (restore)
+C -> B : set_tensor
+B -> P : host -> device DMA
+note right of FW
+  defrag/셀 이동은 보드 내 device-to-device
+  복사(그래프의 cpy 노드)로 처리 - 역시 PCIe 무관.
+  firmware는 forward 사이의 이런 외부 DMA를
+  용인해야 한다 (계약 불변식 5).
+end note
+@enduml
