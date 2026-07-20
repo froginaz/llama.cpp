@@ -91,7 +91,7 @@ The essential difference is **who holds the cell ledger** (which cell belongs to
 
 ## 5. Implementation plan: migrating to host-visible KV
 
-This section is the concrete plan for the key feature identified in section 4. It is written so the collaborator can execute it without access to this conversation.
+This section is the concrete plan for the key feature identified in section 4. It is written so the collaborator can execute it without access to this conversation. A Korean technical companion covering the same ground in more depth (mechanism, contract, sequence diagram) is [doc 14](14-host-visible-kv.md).
 
 ### 5.0 Why - the tensor-role taxonomy and the "stateful node" problem
 
@@ -236,5 +236,5 @@ Caveats:
 
 1. From this document, jump via the section-3 map to the documents for the key feature being started (first time: full reading order in section 6, ~30 minutes). For the host-visible KV migration specifically, execute the plan in section 5.
 2. Skim the decision timeline: `git log --oneline -- docs/my_doc`.
-3. Do the NPU work **on a branch in your own environment** (never push to this repo). If you add documents, continue the numbering from 14, and maintain your own README index - your documents will not come back to this repo either.
+3. Do the NPU work **on a branch in your own environment** (never push to this repo). If you add documents, continue the numbering from 15 (14 is taken by the host-visible KV doc), and maintain your own README index - your documents will not come back to this repo either.
 4. When this repo's work is updated, receive it via the incremental bundle of section 9. No conflict risk: this side only touches `docs/my_doc/`, the NPU code lives under `ggml/src/`.
