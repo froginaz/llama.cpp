@@ -49,6 +49,17 @@ note over KV
   즉 [K벡터 길이, 셀 수, 스트림] - row-major 표기로 뒤집으면
   [n_stream, kv_size, n_embd_k_gqa]
 
+  **왜 d_head=128, n_head_kv=8인가** (llama.cpp가 아닌 모델 설계 값 - GGUF에서 읽음):
+    d_head=128  : n_embd(4096) / n_head(32). 헤드당 부분공간의 표현력은
+                  경험적으로 64~128이 최적 구간이고, 2의 거듭제곱이라
+                  GPU 타일/텐서코어/FA 커널 최적화와 정합
+                  (Llama/Qwen/Mistral 계열 표준. Gemma 2는 256 사용)
+    n_head_kv=8 : GQA 그룹 크기(Q헤드 4개당 KV헤드 1개)의 스위트스폿 -
+                  KV 캐시 1/4 절감에 품질 저하는 미미 (GQA 논문의 결론).
+                  부수적으로 8-way 텐서 병렬 샤딩(GPU 8장에 KV헤드
+                  1개씩)과 나누어떨어지는 실용적 이유도 있음
+                  (Llama-2-70B 이후 Llama/Mistral 계열 표준)
+
   **축 선택의 원리** (접근 패턴에서 역산된 설계):
     ne0=벡터 길이 : 쓰기 = 토큰 1개의 K가 연속 행 1개로 기록되고
                     (ggml_set_rows, 셀 = 행), 읽기 = mul_mat의
