@@ -71,7 +71,7 @@ The essential difference is **who holds the cell ledger** (which cell belongs to
    - prompt sharing: `seq_cp` adds tags without copying (prefill a system prompt once, share across N slots)
    - partial removal / rollback: `seq_rm(seq, p0, p1)` - without this, **speculative decoding is impossible** (rejected draft tokens must be evicted), and so is context shift
    - session save/restore: `llama_state_seq_*` requires KV to be visible as ggml tensors
-   - defrag/optimization: the `memory_update(true)` retry path
+   - K-shift (context shift / `--cache-reuse` / self-extend): the `memory_update` path runs a RoPE re-rotation graph over cached K rows (src/llama-kv-cache.cpp:798) - the one manipulation that needs a device kernel. Note: classic defrag has been **removed** in the current tree; non-contiguous idxs placement replaced it (see doc 14 sections 7-9 for the residency model, per-manipulation mechanics, and support-grade table)
    - quantized KV: `-ctk/-ctv q8_0` handled at the buft level
    With firmware management, each of these becomes one more firmware API (rollback API, copy API, save API, ...) whose semantics must be kept in sync with llama.cpp forever.
 2. **Ecosystem compatibility**: llama-server slot-cache reuse (`-sps`), `llama-batched`/`llama-parallel`, and future upstream memory types (SWA/iSWA, MLA, hybrid, recurrent) work on the dNPU **without code changes**. With firmware management, every tool accumulates "not on dNPU" exceptions.

@@ -247,21 +247,76 @@ end note
 @enduml
 ```
 
-## 7. 무엇이 열리는가 (기능 해금 목록)
+## 7. 상주 모델과 KV 조작 메커니즘
 
-visible KV가 완성되면 13번 문서 5장의 기능들이 **firmware 추가 변경 없이** 열린다:
+### 무엇이 어디에 사는가
 
-| 기능 | 의존하는 것 |
-|---|---|
-| speculative decoding | `seq_rm` rollback (장부 수정 + mask) |
-| 프롬프트/시스템 프롬프트 공유 | `seq_cp` (복사 없는 태그 추가) |
-| session save/restore, 서버 슬롯 저장 | 버퍼 `get_tensor`/`set_tensor` |
-| context shift, defrag | 장부 재배치 + idxs 비연속 계약 |
-| 멀티 시퀀스 서빙 (-np N) | 위 전부 + **batch API의 seq_id 지원** (별도 관문) |
+| 위치 | 있는 것 | 없는 것 |
+|---|---|---|
+| **Host RAM** | (a) `llama_kv_cells` **장부**: 셀별 pos, seq_id 비트셋, used 카운트, head 위치 (b) `ggml_tensor` 구조체 자체 - ne/nb 메타데이터 (`data` 포인터는 **NPU 주소**를 가리킴) (c) 서버라면 슬롯별 **토큰 id 리스트** 사본 (prefix 매칭용) | **KV 데이터는 한 바이트도 없음** - "비어 있는 미러 텐서"조차 없다 |
+| **NPU VRAM** | `cache_k_l/v_l` 실데이터 - context 생성 시 **전체 크기(n_ctx분)를 선할당** | 장부 (firmware는 seq_id를 모름) |
 
-마지막 행이 중요하다: visible KV만으로는 멀티 시퀀스가 완성되지 않는다. NPU forward API가 토큰별 seq 소속을 표현할 수 있어야 하는데, 다행히 **firmware는 seq_id를 알 필요가 없다** - host가 seq 정보를 이미 KQ_mask와 idxs에 구워 넣어 주기 때문이다. 즉 batch API 확장의 실체는 "여러 seq의 토큰이 섞인 ubatch를 받아들이는 것"뿐이고, 격리는 mask가 처리한다.
+흔한 오해 두 가지의 교정:
 
-## 8. 검증 전략
+- **"host가 필요시 get_tensor로 일부를 가져온다"** - 맞지만 그 "필요시"는 **session save 때뿐**이다. 일상 추론 경로에서 host는 KV 데이터를 절대 읽지 않고, save 시에도 임시 버퍼로 DMA해 직렬화한 뒤 사본을 유지하지 않는다.
+- **"스텝별로 stack된다"** - 할당이 자라는 것이 아니라 **선할당된 셀에 행을 기록**하는 것이다. VRAM 사용량은 context 생성 순간 고정이고, 스텝마다 변하는 것은 "채워진 셀 수"라는 장부상의 상태뿐이다.
+
+### 조작별 분해: "장부 편집 + (필요시) 디바이스 작업"
+
+모든 KV 조작은 이 공식으로 분해된다:
+
+| 조작 | 장부 작업 (host) | 디바이스 작업 | PCIe |
+|---|---|---|---|
+| **reuse** (프롬프트 재사용) | 새 요청의 토큰 리스트를 슬롯의 토큰 리스트와 비교 -> 공통 prefix의 셀 유지, **suffix만 decode** | 없음 | 0 |
+| **sharing** (`seq_cp`, unified) | 셀의 seq 비트셋에 태그 추가 | 없음 (복사 자체가 없음) | 0 |
+| sharing (비통합, stream 간) | 장부 복사 | **stream 통째 device-to-device 복사** (`ggml_backend_tensor_copy`, src/llama-kv-cache.cpp:774) | 0 |
+| **rewind** (`seq_rm(seq, p0, -1)`) | 해당 pos 구간 태그 제거 -> 셀 free | 없음 - 데이터는 그대로, 다음 KQ_mask가 제외 | 0 |
+| **remove/clear/keep** | 장부만 | 없음 | 0 |
+| **shift** (`seq_add`, context shift) | pos에 delta 반영, `has_shift` 마킹 | **K-shift 그래프 실행** | 0 |
+| **save/restore** | 장부(셀 메타데이터) 직렬화 | `get_tensor`/`set_tensor` | **MB급 DMA** (유일) |
+
+K-shift가 디바이스 작업이 필요한 유일한 "연산성" 조작인 이유: K는 RoPE(위치 회전)가 **구워진 채로** 캐시에 저장된다. pos를 delta만큼 옮기면 저장된 K의 회전각이 틀어지므로, `build_graph_shift`(src/llama-kv-cache.cpp:798)가 캐시 안의 K 행들에 RoPE 재회전을 적용하는 그래프를 만들어 디바이스에서 실행한다 (`memory_update` 경로, src/llama-kv-cache.cpp:783~812). V는 위치 정보가 없어 무관하다.
+
+## 8. 기능 전체 목록과 dNPU 지원 등급
+
+| 기능 | API / 옵션 | 요구사항 등급 |
+|---|---|---|
+| 부분/전체 삭제, rollback | `llama_memory_seq_rm` | **A** (장부만) |
+| prefix 공유 | `seq_cp` (unified) | **A** |
+| 시퀀스 유지/정리 | `seq_keep`, `clear` | **A** |
+| pos 조회 | `seq_pos_min/max` | **A** |
+| SWA 자동 프루닝 | (iSWA 캐시 내부) - 윈도우 밖 셀 태그 해제 | **A** |
+| 서버 슬롯 prefix 재사용 | `-sps` (토큰 리스트 매칭) | **A** |
+| context shift / 청크 재사용 | `seq_add`, 서버 `--cache-reuse` | **B** (K-shift 그래프) |
+| self-extend | `seq_div` (pos 나눗셈) | **B** |
+| stream 간 복사 | 비통합 `seq_cp` | **C** (device blit) |
+| session save/restore, 슬롯 저장 | `llama_state_seq_*`, `--slot-save-path` | **D** (DMA) |
+| KV 양자화 | `-ctk/-ctv` | **E** (firmware dequant) |
+
+등급이 곧 firmware 요구사항이고, 단계적 지원이 가능하다:
+
+- **등급 A (장부만)**: forward 계약(idxs + KQ_mask)만 있으면 **firmware 추가 작업 0**으로 전부 동작한다. rollback(-> speculative), 프롬프트 공유, 슬롯 재사용이 여기 속한다는 것이 host-visible KV의 최대 배당이다.
+- **등급 B (K-shift)**: firmware에 "캐시 K 행들에 RoPE 재회전" 커맨드 1개가 필요하다. 단일 CUSTOM 노드 구조라면 `k_shift(cell 목록, delta)` 커맨드를 forward와 별도로 추가하는 형태. 미지원 시 `get_can_shift()=false`로 보고하면 shift 계열 기능만 빠지고 나머지는 무관하다.
+- **등급 C**: buffer iface의 `cpy_tensor`(device-to-device)로 구현 - PCIe를 건너지 않는다.
+- **등급 D**: 이미 buft 요구사항(`get/set_tensor`)에 포함.
+- **등급 E**: 후순위 옵션.
+
+멀티 시퀀스 서빙(-np N)은 위 등급 A 기능들 + **batch API의 seq_id 지원**(별도 관문)의 조합이다. visible KV만으로는 완성되지 않지만, 다행히 **firmware는 seq_id를 알 필요가 없다** - host가 seq 정보를 이미 KQ_mask와 idxs에 구워 넣어 주기 때문이다. 즉 batch API 확장의 실체는 "여러 seq의 토큰이 섞인 ubatch를 받아들이는 것"뿐이고, 격리는 mask가 처리한다.
+
+## 9. Defrag: 현재는 없다 - 비연속 idxs가 대체한다
+
+**고전 defrag** (이전 버전의 llama.cpp): 단편화 임계값(`--defrag-thold`)을 넘으면 (1) host가 장부를 스캔해 "흩어진 used 셀을 앞쪽 구멍으로 옮기는" 이동 계획(src셀 -> dst셀)을 수립, (2) 레이어별 K/V 행 복사(cpy) 노드들로 그래프를 만들어 **디바이스에서** 실행, (3) 장부의 pos/seq 태그를 같은 계획대로 이동. 데이터는 디바이스를 떠나지 않는다.
+
+**현재 버전에서는 unified KV의 defrag가 제거되었다.** 근거:
+
+- llama-kv-cache.cpp에 defrag 그래프/계획 코드가 없고, `init_update(lctx, optimize)`의 `optimize` 인자가 `GGML_UNUSED`다 (src/llama-kv-cache.cpp:674~680) - decode의 "cache optimization 재시도"가 unified 캐시에서 실제로 하는 일은 shift/stream-copy뿐이다.
+- 제거가 가능해진 이유: `find_slot(ubatch, cont=false)`(src/llama-kv-cache.cpp:824)가 **비연속 셀 배치**를 지원하고 쓰기가 `set_rows` + idxs 기반이라, "구멍 때문에 batch를 놓을 자리가 없다"는 defrag의 존재 이유가 사라졌다. 3장 계약의 "idxs는 비연속일 수 있다"가 바로 defrag를 대체한 메커니즘이다.
+
+**남아 있는 단편화 비용**: `n_kv = pad(used_max_p1)` (src/llama-kv-cache.cpp:1135~1145) - attention 창은 "가장 높은 사용 셀 번호"까지 커버하므로, 높은 번호 셀에 잔존물이 있으면 창이 부풀어 mask/compute가 낭비된다. find_slot이 head부터 낮은 빈 셀을 재사용하는 정책이 이를 자연 완화한다.
+
+**dNPU 함의**: 현 버전 기준으로 defrag용 셀-이동 커널은 **필요 없다** - "비연속 idxs 수용" 계약이 그 역할을 대신한다. 향후 창 압축이 필요해지면 고전 방식(host 계획 + 디바이스 row-copy + 장부 동기 갱신)을 등급 C 커맨드로 추가하면 되고, 역시 PCIe는 건너지 않는다.
+
+## 10. 검증 전략
 
 구현 순서대로 통과해야 할 관문 (상세 절차는 핸드오프 5.2절 M4). PCIe 구성에서는 5번 앞에 "스텝당 PCIe 트래픽이 6장 표와 일치하는지"(특히 KV가 새어 나가지 않는지) 프로파일링을 추가할 것:
 
@@ -280,3 +335,5 @@ visible KV가 완성되면 13번 문서 5장의 기능들이 **firmware 추가 �
 5. **GGML_MAX_SRC=10** 때문에 단일 노드 구조에서는 캐시 64개를 디스크립터 테이블(`register_kv_region`)로 1회 등록하고, 그래프에는 메타데이터만 흘린다.
 6. **rollback 결정성 테스트가 성공 판정 기준**: 이것이 통과하면 speculative/seq_cp/session이 원리적으로 전부 열린 것이다.
 7. **공유 메모리는 필요 없다 (visible != mapped)**: PCIe 분리 구성에서도 KV는 NPU DRAM에 상주하고, 정상 decode에서 PCIe를 오가는 것은 메타데이터(수십 KB)와 logits뿐이다. CUDA dGPU가 이미 이 모델로 동작한다 - 장부 연산은 트래픽 0, session save/restore만 예외적으로 KV를 DMA한다.
+8. **host에는 데이터가 아니라 장부만 산다**: host RAM에는 KV 미러가 없고 `llama_kv_cells` 장부 + 텐서 메타데이터뿐이다. VRAM은 n_ctx분이 선할당되며, "스텝별 stack"은 할당 증가가 아니라 선할당된 셀에 행을 기록하는 것이다.
+9. **조작 = 장부 편집 + (필요시) 디바이스 작업**: 대부분(seq_rm/seq_cp/keep/clear/재사용)은 등급 A(장부만, PCIe 0)이고, K-shift(등급 B)만 캐시에 대한 RoPE 재회전 그래프가 필요하다. **defrag는 현재 버전에 없다** - 비연속 idxs 배치가 그 존재 이유를 대체했다.
