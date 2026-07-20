@@ -277,6 +277,36 @@ end note
 
 K-shift가 디바이스 작업이 필요한 유일한 "연산성" 조작인 이유: K는 RoPE(위치 회전)가 **구워진 채로** 캐시에 저장된다. pos를 delta만큼 옮기면 저장된 K의 회전각이 틀어지므로, `build_graph_shift`(src/llama-kv-cache.cpp:798)가 캐시 안의 K 행들에 RoPE 재회전을 적용하는 그래프를 만들어 디바이스에서 실행한다 (`memory_update` 경로, src/llama-kv-cache.cpp:783~812). V는 위치 정보가 없어 무관하다.
 
+### 장부만 조작하면 mask는 어떻게 맞춰지나 - mask는 저장물이 아니라 파생물이다
+
+위 표에서 등급 A 조작들이 "장부만"으로 끝나는 이유는, **KQ_mask가 수정되는 객체가 아니라 매 스텝 장부에서 새로 계산되는 파생물**이기 때문이다:
+
+1. 매 forward의 `set_inputs()` 시점에 host가 `set_input_kq_mask_impl()`(src/llama-kv-cache.cpp:1440)을 실행한다.
+2. 이 함수의 입력이 바로 장부다 - `v_cells`(셀별 pos/seq 태그)와 이번 ubatch.
+3. 원소별 규칙으로 mask를 처음부터 다시 채운다:
+
+```
+mask[cell i][token j] = 0         if 셀 i에 토큰 j의 seq 태그가 있고
+                                     AND pos_i <= pos_j (causal)
+                                     AND SWA 윈도우 안 (해당 시)
+                      = -INFINITY  otherwise
+```
+
+4. 완성된 mask가 입력 텐서로 업로드된다 (6장 트래픽 표의 "매 스텝 수십 KB"에 포함되는 이유).
+
+즉 `seq_rm` 후 mask를 갱신하는 전파(propagation) 로직은 존재하지 않는다 - 장부에서 태그가 사라졌으므로 **다음 스텝에 재파생(re-derivation)되는 mask가 자연히 그 셀을 -inf로 내놓을** 뿐이다:
+
+```
+장부 (single source of truth, host)
+   |  매 스텝 set_inputs에서 재파생
+   v
+KQ_mask (그 스텝 한정의 스냅샷, 입력 텐서)  ->  forward가 소비 후 폐기
+```
+
+이 구조라 mask와 장부가 "어긋날" 수 있는 별도 상태가 애초에 없어 일관성 버그가 원리적으로 불가능하다. 그래프 재사용 경로에서도 `set_inputs`는 매 스텝 다시 실행되므로(재사용되는 것은 토폴로지지 입력값이 아님) mask는 항상 최신 장부를 반영한다.
+
+**dNPU 관점**: firmware는 mask를 "받아서 원소 그대로 적용"만 하면 되고, mask의 생성·최신성은 전적으로 host 책임이다. 검증할 것은 "받은 mask를 정확히 적용하는가" 하나뿐이며, 장부 -> mask 파생의 정확성은 stock llama.cpp 코드가 보장한다.
+
 ## 8. 기능 전체 목록과 dNPU 지원 등급
 
 | 기능 | API / 옵션 | 요구사항 등급 |
@@ -337,3 +367,4 @@ K-shift가 디바이스 작업이 필요한 유일한 "연산성" 조작인 이�
 7. **공유 메모리는 필요 없다 (visible != mapped)**: PCIe 분리 구성에서도 KV는 NPU DRAM에 상주하고, 정상 decode에서 PCIe를 오가는 것은 메타데이터(수십 KB)와 logits뿐이다. CUDA dGPU가 이미 이 모델로 동작한다 - 장부 연산은 트래픽 0, session save/restore만 예외적으로 KV를 DMA한다.
 8. **host에는 데이터가 아니라 장부만 산다**: host RAM에는 KV 미러가 없고 `llama_kv_cells` 장부 + 텐서 메타데이터뿐이다. VRAM은 n_ctx분이 선할당되며, "스텝별 stack"은 할당 증가가 아니라 선할당된 셀에 행을 기록하는 것이다.
 9. **조작 = 장부 편집 + (필요시) 디바이스 작업**: 대부분(seq_rm/seq_cp/keep/clear/재사용)은 등급 A(장부만, PCIe 0)이고, K-shift(등급 B)만 캐시에 대한 RoPE 재회전 그래프가 필요하다. **defrag는 현재 버전에 없다** - 비연속 idxs 배치가 그 존재 이유를 대체했다.
+10. **mask는 저장물이 아니라 파생물**: 매 스텝 `set_inputs`가 장부(v_cells)에서 KQ_mask를 재파생하므로, 장부만 고치면 mask는 "자동으로" 맞는다 - 전파 로직도, 어긋날 수 있는 별도 상태도 없다. firmware의 책임은 받은 mask를 원소 그대로 적용하는 것뿐이다.
