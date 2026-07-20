@@ -9,7 +9,7 @@ Ground rules:
 - Reference branch: `claude/llaam-context-ggml-backend-qb6nqa`
 - The documentation series itself (01~13) is written in Korean; this handoff document is in English.
 
-**Status**: the collaborator has already **completed Phase 1** (single-sequence end-to-end path based on a single-node CUSTOM cgraph; see the confirmed profile in section 2). The center of gravity of this document is therefore not "getting started" but a **reference map for the next phase** (sections 3 and 4).
+**Status**: the collaborator has already **completed Phase 1** (single-sequence end-to-end path based on a single-node CUSTOM cgraph; see the confirmed profile in section 2). The center of gravity of this document is therefore not "getting started" but a **reference map for the next phase**: section 3 (doc map), section 4 (KV ownership decision), and section 5 (the host-visible KV implementation plan).
 
 ---
 
@@ -46,7 +46,7 @@ One-line summary: **"a llama-cli / llama-simple grade single-sequence path in wh
 | Next step (key feature) | Directly relevant documents / diagrams |
 |---|---|
 | **seq_id support in the batch API** -> multi-sequence | Doc 13 ch.1~3: `llama_batch` seq_id/pos/logits layout (ch.2 table), ubatch split rules (split_simple), and in the annotated prefill/decode diagrams, **how KQ_mask implements sequence isolation** - the exact contract the NPU firmware must reproduce |
-| **Host-visible KV** | Doc 13 ch.6 (cell model: K-vector width x cell count x streams) and the KV state tables in the deep-dive diagrams (meaning of find_slot/apply); doc 12 buft/buffer ownership (who allocates/frees) |
+| **Host-visible KV** | **Full implementation plan in section 5 of this document.** Background: doc 13 ch.6 (cell model: K-vector width x cell count x streams), the KV state tables in the deep-dive diagrams (meaning of find_slot/apply), doc 12 buft/buffer ownership (who allocates/frees) |
 | Features unlocked by visible KV (use as a verification checklist) | Doc 13 ch.5: seq_cp prompt sharing, session save/restore, llama-server slot-cache reuse |
 | **Standard GGUF template + per-op support** (Phase 2) | Docs 01~05 (GGUF -> hparams -> build_graph -> cgraph pipeline), `tests/test-backend-ops.cpp` (per-op correctness) - CPU fallback / partial offload / op-level verification only come alive at this stage |
 
@@ -89,7 +89,84 @@ The essential difference is **who holds the cell ledger** (which cell belongs to
 
 > Firmware management is "**a simple interface, a wall of features**"; llama.cpp management is "**a layout contract, freedom of features**". Up to single-conversation E2E (the current point) firmware management is reasonable, but the roadmap destinations - multi-sequence serving, speculative decoding, slot caching - all stand on llama.cpp-managed KV. Hence "host-visible KV is the key feature" is the right call, and its substance is: **the firmware accepts externally injected KV buffer pointers plus the cell-layout contract (K-vector width x cell count x streams)**. As an interim compromise, adding just two firmware APIs first - per-seq rollback and full reset - unlocks speculative decoding and basic server operation.
 
-## 5. Reading order (NPU backend perspective)
+## 5. Implementation plan: migrating to host-visible KV
+
+This section is the concrete plan for the key feature identified in section 4. It is written so the collaborator can execute it without access to this conversation.
+
+### 5.0 Why - the tensor-role taxonomy and the "stateful node" problem
+
+A ggml graph references three kinds of tensors:
+
+| Role | Data lives in | Host fills it every step? | Examples |
+|---|---|---|---|
+| **True inputs** (`ggml_set_input`, copied by `set_inputs()`) | compute buffer | **yes** | `inp_tokens`, `inp_pos`, `KQ_mask`, `inp_out_ids`, **`k_idxs` / `v_idxs`** |
+| **Persistent leafs** (exist outside the graph) | weight buffer / **KV buffer** | no - referenced by pointer | weights, **`cache_k_l` / `cache_v_l`** |
+| Computed nodes | compute buffer | no - produced by the graph | Q/K/V, scores, FFN outputs |
+
+In stock llama.cpp the KV cache is a **persistent, mutable leaf**: attention reads it through zero-copy views (`[d, n_kv]` window) and writes new entries through `ggml_set_rows(cache, cur, idxs)` nodes **inside the graph**. The "past" is never passed as data; only per-step **metadata** is passed as true inputs: `k_idxs`/`v_idxs` (which cells to write; built by `build_input_k_idxs`, src/llama-kv-cache.cpp:1294) and `KQ_mask` (which cells may be attended - the modern replacement of the old `n_past` parameter).
+
+Today's dNPU CUSTOM node hides KV inside firmware, so the node is **stateful**: it is not a pure function of its inputs and leafs. That single property is what blocks rollback (speculative decoding), `seq_rm/seq_cp`, session save/restore, and multi-sequence slot management. The goal of this migration is to make the node **pure again**: KV becomes an explicit persistent-leaf operand; per-step state selection travels through `k_idxs`/`v_idxs`/`KQ_mask`.
+
+### 5.1 Target architecture
+
+Layout contract (per layer, identical to stock llama.cpp; see doc 13 ch.6 and the deep-dive axis notes):
+
+```
+cache_k_l{il} : [n_embd_k_gqa, kv_size, n_stream]   (ne0 contiguous = one cell = one row)
+cache_v_l{il} : [n_embd_v_gqa, kv_size, n_stream]   (v_trans = false, i.e. FA-style layout)
+dtype: F16 first (quantized KV is a later option and requires firmware dequant)
+```
+
+Per-step data flow after migration:
+
+```
+host (llama.cpp)                          NPU firmware
+----------------                          ------------
+memory->init_batch/apply                  -
+  -> plans cells, builds k_idxs/v_idxs
+set_inputs: tokens, pos,                  forward(tokens, pos, k_idxs, v_idxs,
+  k_idxs, v_idxs, KQ_mask  ------------->         n_kv, KQ_mask):
+                                            for each layer:
+                                              write new K/V rows at cells k_idxs[i]
+                                              attend over window [0, n_kv) under KQ_mask
+                                          <- logits
+```
+
+Invariants the firmware MUST honor (these are the semantic contract, not suggestions):
+
+1. **Mask-only isolation**: `seq_rm` only edits host-side cell metadata - cells are never zeroed. Firmware must never assume residual cell contents mean anything; only `KQ_mask` and the idxs define validity.
+2. **Idxs may be non-contiguous** (after defrag/reuse) - no "append at tail" assumption.
+3. **Same cell index across all layers** for a given token (one ledger, 2 x n_layer tensors).
+4. `n_kv` is a padded window; masked-out padding cells must contribute nothing.
+5. Host may write KV outside the graph (session restore via buffer `set_tensor`) and read it (session save) - firmware must tolerate external writes between forwards.
+
+### 5.2 Milestones
+
+- **M0 - decisions**: KV residency (recommended: NPU-local memory that the host can also address; if not host-mappable, buffer `set_tensor`/`get_tensor` must be implemented as DMA copies). Confirm firmware can consume an externally provided KV region table.
+- **M1 - NPU buffer_type for KV**: extend the existing NPU buft (already used for GGUF-mapped weights) with a mutable, host-writable buffer: `alloc_buffer`, `get_base`, `set_tensor`, `get_tensor`, `clear`. `get_tensor` is what makes session save possible; `set_tensor` makes restore possible.
+- **M2 - firmware API**: (a) `register_kv_region(layer, k_base, v_base, cell_stride, n_cells, n_stream, dtype)` called once at context init - a descriptor table avoids passing 2 x n_layer tensors as node srcs (**`GGML_MAX_SRC` = 10**, ggml.h:224 - a single CUSTOM node cannot carry 64 cache operands; the table is the Phase-1-compatible workaround, per-layer nodes are the Phase-2 alternative). (b) extend `forward()` with `k_idxs/v_idxs/n_kv/KQ_mask`.
+- **M3 - llama.cpp side**: use the **stock `llama_kv_cache`** with the NPU buft - no custom memory class should be needed. In the custom `build_arch_graph`, reuse llama.cpp's own helpers (`build_input_k_idxs`, the kq_mask builders) so semantics match CPU exactly; `set_inputs` then works unchanged.
+- **M4 - parity verification** (in order):
+  1. single-seq logit parity vs CPU backend on fixed prompts (tolerance ~1e-2 relative for F16);
+  2. **rollback determinism**: decode N tokens, `llama_memory_seq_rm(tail)`, re-decode - outputs must match bit-for-bit with a fresh run;
+  3. session roundtrip: `llama_state_seq_save_file` -> restore into a fresh context -> continue decoding, compare;
+  4. `memory_breakdown()` reports KV on the NPU buft.
+- **M5 - feature unlock ladder**: rollback test green -> speculative decoding usable; then batch-API seq_id (the other gateway) -> `llama-batched -np 2` -> `llama-parallel` -> llama-server slots with `-sps` cache reuse.
+
+### 5.3 Pitfall checklist
+
+- `GGML_MAX_SRC = 10`: do not try to make cache tensors node srcs on the monolithic node (see M2).
+- Do not zero/scrub cells on `seq_rm` and do not rely on zeroed memory - mask-only isolation.
+- Use the `!v_trans` (FA-style) layout; the transposed-V path (llama-kv-cache.cpp:1257 onward) exists only for non-FA CPU/GPU kernels.
+- Synchronization: host `set_tensor` writes (session restore) must be visible to firmware before the next forward; wire this through the backend's `synchronize`.
+- `n_ctx` is padded to 256 (llama-context.cpp:204); the mask width `n_kv` is padded separately - never derive one from the other.
+- Cell metadata (which seq/pos owns a cell) lives **only on the host**; firmware sees indices and masks, never seq_ids.
+
+### 5.4 Definition of done
+
+Host-visible KV is "done" when: parity (M4.1) + rollback (M4.2) + session roundtrip (M4.3) all pass, and `llama-batched -np 2` runs correctly once the batch API gains seq_id support. At that point every feature in doc 13 ch.5 becomes available without further firmware changes.
+
+## 6. Reading order (NPU backend perspective)
 
 Not everything needs to be read. For NPU backend work:
 
@@ -98,7 +175,7 @@ Not everything needs to be read. For NPU backend work:
 3. **[13-batch-ubatch-and-sequences.md](13-batch-ubatch-and-sequences.md)** - the execution units a backend actually receives. **Compute-buffer size is determined by the n_ubatch width**; graph-reuse conditions; the tensor-shape flow in the [annotated deep-dive puml](13-sequence-decode-batch2-single-context-detailed.puml) bears directly on NPU memory design.
 4. (For more background) 06-execution-and-scheduling.md, 08-hardware-divergence.md.
 
-## 6. Code entry points
+## 7. Code entry points
 
 | File | Role |
 |---|---|
@@ -113,13 +190,13 @@ The contract with sched is central: a backend declares its capabilities via `sup
 
 Recommended smoke-test ladder: `test-backend-ops` (op correctness) -> `llama-cli -m tiny-model -ngl 99` (single-seq E2E) -> `llama-batched -np 2` (multi-seq) -> `llama-batched-bench` (throughput).
 
-## 7. Working conventions (as practiced in this repo)
+## 8. Working conventions (as practiced in this repo)
 
 - **Read AGENTS.md first**: AI-generated PRs to upstream (ggml-org/llama.cpp) are prohibited. **Private forks / internal work are exempt**, so the NPU work itself is fine - but if any of it is ever aimed at upstream, the AGENTS.md process (a human must fully understand and be able to defend the change) applies.
 - Documentation conventions: `NN-topic.md` numbering, PlantUML both inline (code block) and as separate `.puml` files, keep the README.md index updated, ASCII arrows (`->`).
 - Commit conventions: `[DOC] one-line summary` + `Assisted-by: Claude` trailer (Co-authored-by is prohibited by AGENTS.md).
 
-## 8. Transfer method (bundle recipe)
+## 9. Transfer method (bundle recipe)
 
 ### If the collaborator can read this repo
 
@@ -155,9 +232,9 @@ Caveats:
 - The basis commit must exist upstream (a commit with a PR number in its subject is safe).
 - If only the files (no history) are needed, `git archive HEAD docs/my_doc -o docs.tar` is the minimal alternative - not recommended, since the commit-message timeline is lost.
 
-## 9. For the collaborator: continuing to the next phase
+## 10. For the collaborator: continuing to the next phase
 
-1. From this document, jump via the section-3 map to the documents for the key feature being started (first time: full reading order in section 5, ~30 minutes).
+1. From this document, jump via the section-3 map to the documents for the key feature being started (first time: full reading order in section 6, ~30 minutes). For the host-visible KV migration specifically, execute the plan in section 5.
 2. Skim the decision timeline: `git log --oneline -- docs/my_doc`.
 3. Do the NPU work **on a branch in your own environment** (never push to this repo). If you add documents, continue the numbering from 14, and maintain your own README index - your documents will not come back to this repo either.
-4. When this repo's work is updated, receive it via the incremental bundle of section 8. No conflict risk: this side only touches `docs/my_doc/`, the NPU code lives under `ggml/src/`.
+4. When this repo's work is updated, receive it via the incremental bundle of section 9. No conflict risk: this side only touches `docs/my_doc/`, the NPU code lives under `ggml/src/`.
