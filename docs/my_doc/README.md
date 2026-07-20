@@ -147,7 +147,7 @@ Walking the stages in execution order:
 
 ### Appendix diagrams & cross-runtime notes
 
-- [00-handoff-npu-backend.md](00-handoff-npu-backend.md) — onboarding entry point for external collaborators (NPU backend work): reading order, code entry points, conventions, and a validated one-way git-bundle transfer recipe (Korean).
+- [00-handoff-npu-backend.md](00-handoff-npu-backend.md) — entry point for external collaborators (NPU backend work, English): dNPU phase-1 profile, next-step doc map, KV-cache ownership decision guide, code entry points, conventions, and a validated one-way git-bundle transfer recipe.
 
 - [09-sequence-gguf-to-cgraph.wsd](09-sequence-gguf-to-cgraph.wsd) — PlantUML sequence: GGUF + per-arch C++ ⇒ `ggml_cgraph`.
 - [10-llama-model-class-diagram.wsd](10-llama-model-class-diagram.wsd) — PlantUML class diagram of `src/llama-model.h`.
