@@ -281,19 +281,170 @@ end note
 
 ### 생성 시점의 실제 과정: 장부 할당과 DRAM 예약
 
-`llama_init_from_model()` -> `llama_context` 생성자 -> `model.create_memory()` -> `llama_kv_cache` 생성자에서 일어나는 일을 코드 순서대로 따라가면 (6장 다이어그램의 0-b/0-c 구간):
+`llama_init_from_model()` -> `llama_context` 생성자 -> `model.create_memory()` -> `llama_kv_cache` 생성자에서 일어나는 일을 코드 순서대로 따라간다 (6장 다이어그램의 0-b/0-c 구간). 먼저 진입점 - `create_memory()`가 생성자에 넘기는 인자들의 실체:
 
-1. **파라미터 확정**: `n_stream = unified ? 1 : n_seq_max`, `kv_size`는 `n_pad` 배수 검증 (src/llama-kv-cache.cpp:96~98)
-2. **장부 할당 (host RAM)**: `v_heads.resize(n_stream)` = 0, `v_cells[s].resize(kv_size)` - 셀당 pos 1개 + seq 비트셋을 담는 배열들, 전 셀 empty 상태 (src/llama-kv-cache.cpp:135~143). `seq_to_stream` 매핑 초기화 (146~153). 크기: 셀당 ~16B x 8192셀 = **수백 KB 수준** - GB급 데이터와 대비되는 장부의 가벼움이다. PCIe 트래픽 0.
-3. **메타데이터 풀**: buft별 `ggml_context`를 `no_alloc=true`로 생성 - 텐서 구조체(ne/nb)만 담는 host RAM 풀, 데이터 공간 없음 (src/llama-kv-cache.cpp:111~131)
-4. **레이어별 buft 선택**: `offload_kqv=true`면 그 레이어 디바이스(dev_layer)의 buffer type, `false`면 CPU buft - `--no-kv-offload`로 KV를 host RAM에 두는 경로가 바로 이 분기다 (src/llama-kv-cache.cpp:190~199)
-5. **텐서 메타 생성**: `ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream)` - ne/nb만 설정되고 `data = null` (src/llama-kv-cache.cpp:211)
-6. **DRAM 예약**: `ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft)` (src/llama-kv-cache.cpp:263) - 그 buft 소속 텐서들의 크기를 합산해 `alloc_buffer`를 **1회** 호출한다. NPU 구현에서 이것이 "드라이버에 DRAM 영역 예약 요청"이며 **제어 메시지만 오가고 데이터 전송은 없다**. 반환된 base 디바이스 주소로 각 `tensor->data = base + offset`이 기록된다 - host측 텐서 구조체가 **디바이스 주소**를 담게 되는 순간이다.
-7. **초기화**: `ggml_backend_buffer_clear(buf, 0)` (src/llama-kv-cache.cpp:271, 주석 "initialize the buffers to avoid NaNs in the padding") - NPU에서는 device memset 커맨드다. GB급 0 데이터를 PCIe로 보내는 것이 아니다.
-8. **크기 보고**: "KV buffer size = N MiB" 로그(269)와 K/V 합산 로그(279) - `memory_breakdown()`에 잡히는 값이다.
-9. **(NPU 확장) 디스크립터 등록**: 6에서 확정된 `tensor->data` 주소와 `nb` stride로 `register_kv_region` 테이블을 구성해 firmware에 1회 전달한다.
+```cpp
+// src/llama-model.cpp:2163~2177
+res = new llama_kv_cache(
+        *this, hparams,
+        params.type_k, params.type_v,
+        !cparams.flash_attn,      // v_trans: FA가 아닐 때만 V를 전치 저장
+        cparams.offload_kqv,      // offload: KV를 디바이스에 둘 것인가
+        cparams.kv_unified,       // unified: 스트림 1개 vs seq별 스트림
+        cparams.n_ctx_seq,        // kv_size <- n_ctx가 아니라 n_ctx_seq!
+        cparams.n_seq_max,
+        1,                        // n_pad
+        hparams.n_swa, hparams.swa_type,
+        filter, nullptr);
+```
 
-참고: `hparams.no_alloc` 모드(실측 없이 크기만 계산하는 dry-run)에서는 6 대신 크기 0의 더미 버퍼가 붙는다 (src/llama-kv-cache.cpp:257~261).
+주의할 인자 하나: `kv_size`로 들어가는 것은 **"스트림 1개의 셀 수" = `n_ctx_seq`**다. unified면 `n_ctx_seq == n_ctx`라 구분이 안 보이지만, 비통합이면 스트림당 `n_ctx/n_seq_max`가 들어간다 (총량은 x n_stream으로 동일).
+
+**1. 멤버 확정과 n_pad 검증** (src/llama-kv-cache.cpp:95~98):
+
+```cpp
+model(model), hparams(hparams), v_trans(v_trans),
+n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), ... {
+
+    GGML_ASSERT(kv_size % n_pad == 0);
+```
+
+`n_stream` 결정이 멤버 초기화 리스트에서 일어난다. `n_pad`는 "셀 수가 이 값의 배수여야 한다"는 **버퍼 크기 정렬 요구**인데, 현재는 기본값 1이 전달되므로(llama-model.cpp:2173, 헤더 기본값도 1 - llama-kv-cache.h:237) 이 assert는 사실상 통과 의례다. 혼동 주의: **attention 창의 패딩은 별개**로, `get_n_kv()`가 `max(n_pad, 256)` 단위로 창을 패딩한다(1140행). 즉 "버퍼 정렬(n_pad, 현재 1)"과 "창 패딩(256)"은 다른 메커니즘이다.
+
+**2. 장부 할당 (host RAM)** (src/llama-kv-cache.cpp:135~143):
+
+```cpp
+v_heads.resize(n_stream);
+for (uint32_t s = 0; s < n_stream; ++s) v_heads[s] = 0;
+
+v_cells.resize(n_stream);
+for (uint32_t s = 0; s < n_stream; ++s) v_cells[s].resize(kv_size);
+```
+
+`v_heads[s]` = 스트림 s에서 다음 빈 칸 탐색을 시작할 위치(find_slot의 출발점). 셀 하나의 실체는 `llama_kv_cells`의 병렬 배열들이다 (src/llama-kv-cells.h:34~48의 reset()이 필드 전체를 보여준다):
+
+```cpp
+pos[i]   = -1;      // 이 칸에 든 토큰의 pos (-1 = 빈 칸)
+ext[i].reset();     // M-RoPE용 2D 좌표 (x, y) - 텍스트 모델은 미사용
+shift[i] =  0;      // 아직 K에 반영 안 된 누적 K-shift delta
+seq[i].reset();     // std::bitset<LLAMA_MAX_SEQ> - 소유 seq 태그들
+// + used (사용 중 셀 집합), seq_pos[s] (seq별 pos 집합 - 보조 색인)
+```
+
+`seq[i]`가 **비트셋**이라는 것이 seq_cp 공유의 물리적 기반이다 - 한 셀에 여러 seq 태그를 동시에 달 수 있다. 전체 크기는 셀당 ~수십 B x 8192셀 = **수백 KB 수준**(host RAM). PCIe 트래픽 0.
+
+**3. seq_to_stream 매핑 초기화** (src/llama-kv-cache.cpp:145~153):
+
+```cpp
+// by default, all sequence ids are mapped to the 0th stream
+seq_to_stream.resize(LLAMA_MAX_SEQ, 0);
+
+if (n_stream > 1) {
+    seq_to_stream.resize(n_stream, 0);
+    for (uint32_t s = 0; s < n_stream; ++s) seq_to_stream[s] = s;
+}
+```
+
+"seq_id s의 셀 배열이 어느 스트림에 있는가"의 조회표다. unified(n_stream=1)면 모든 seq -> 스트림 0 (한 배열을 나눠 씀), 비통합이면 seq s -> 스트림 s (전용 배열). 이후 find_slot(829행)과 mask 생성(1477행)이 `v_cells[seq_to_stream[seq_id]]` 형태로 이 표를 탄다.
+
+**4. 메타데이터 풀 - buft별 ggml_context** (src/llama-kv-cache.cpp:111~131):
+
+```cpp
+ggml_init_params params = {
+    /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer*ggml_tensor_overhead()),
+    /*.mem_buffer =*/ NULL,
+    /*.no_alloc   =*/ true,     // <- 데이터 공간 없이 구조체만
+};
+ggml_context * ctx = ggml_init(params);
+```
+
+`mem_size` 산식을 풀면: (K, V **2**종) x (본체 1 + 스트림 뷰 n_stream = **1+n_stream**개) x **n_layer** x 구조체 오버헤드 - 7단계에서 만들 텐서/뷰의 개수를 정확히 예산한 것이다. `no_alloc=true`가 "ne/nb 메타데이터만, 데이터는 나중에" 모드의 스위치다.
+
+**5. 레이어 순회 - 필터와 폭 계산** (src/llama-kv-cache.cpp:163~188):
+
+```cpp
+for (uint32_t il = 0; il < n_layer; il++) {
+    if (!hparams.has_kv(il))    continue;   // attention KV가 없는 레이어 제외
+    if (filter && !filter(il))  continue;   // 호출측이 준 레이어 필터
+
+    const uint32_t n_embd_k_gqa =            hparams.n_embd_k_gqa(il);
+    const uint32_t n_embd_v_gqa = !v_trans ? hparams.n_embd_v_gqa(il)
+                                           : hparams.n_embd_v_gqa_max();
+```
+
+`has_kv(il)=false`인 레이어는 하이브리드 모델의 recurrent/linear-attention 층처럼 KV 캐시가 필요 없는 층이다. `filter`는 iSWA 구성이 "SWA 층 캐시"와 "full 층 캐시"를 **같은 생성자로 두 번** 만들 때 층을 가르는 데 쓰인다. v_trans(비-FA)면 V 폭을 레이어 최대값으로 패딩한다(가변 V 폭 모델 대응).
+
+**6. 레이어별 buft 선택** (src/llama-kv-cache.cpp:190~199):
+
+```cpp
+ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+
+if (offload) {
+    auto * dev = model.dev_layer(il);
+    buft = ggml_backend_dev_buffer_type(dev);
+}
+```
+
+`--no-kv-offload`(offload_kqv=false)로 KV를 host RAM에 두는 경로가 바로 이 분기다. offload=true면 **그 레이어가 배치된 디바이스**(model의 dev_layer 계획 - 12번 문서)의 buffer type을 따른다. 멀티 GPU 분할이면 KV도 레이어 단위로 나뉘어 배치되는 이유다.
+
+**7. 텐서 메타 생성 + 스트림 뷰 + 레이어 등록** (src/llama-kv-cache.cpp:208~227):
+
+```cpp
+const bool has_k = true;
+const bool has_v = !is_mla;      // MLA(DeepSeek)는 V 텐서 자체가 없음
+
+ggml_tensor * k = ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream);
+ggml_tensor * v = ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream);
+
+ggml_format_name(k, "cache_k_l%d", il);      // "cache_k_l0", "cache_k_l1", ...
+
+for (uint32_t s = 0; s < n_stream; ++s) {    // 스트림별 2D 뷰
+    k_stream.push_back(ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size,
+                                    k->nb[1], s*k->nb[2]));
+    ...
+}
+
+map_layer_ids[il] = layers.size();           // 모델 레이어 id -> 캐시 내부 인덱스
+layers.push_back({ il, k, v, k_stream, v_stream, });
+```
+
+이 시점의 텐서는 ne/nb만 있고 `data = null`이다(no_alloc). `k_stream[s]` 뷰는 나중에 **stream 간 seq_cp의 복사 단위**가 된다 (`ggml_backend_tensor_copy(layer.k_stream[ssrc], layer.k_stream[sdst])`, 774행). `map_layer_ids`는 5단계 필터로 빠진 레이어가 있어도 "모델 레이어 번호 -> layers[] 인덱스"를 맞추기 위한 압축 색인이다.
+
+**8. 레이어 reuse (해당 모델만)** (src/llama-kv-cache.cpp:230~251):
+
+```cpp
+if (reuse) {
+    for (uint32_t il = 0; il < n_layer; il++) {
+        const int32_t il_reuse = reuse(il);
+        if (il_reuse < 0) continue;
+        map_layer_ids[il] = map_layer_ids[il_reuse];  // 텐서 공유
+    }
+}
+```
+
+cross-layer KV 공유 아키텍처(일부 레이어가 다른 레이어의 K/V를 재사용) 지원 - 텐서를 새로 만들지 않고 **색인만 같은 곳을 가리키게** 한다.
+
+**9. 버퍼 할당(= DRAM 예약) + 클리어 + 로그** (src/llama-kv-cache.cpp:254~283):
+
+```cpp
+// allocate tensors and initialize the buffers to avoid NaNs in the padding
+for (auto & [buft, ctx] : ctx_map) {
+    ggml_backend_buffer_t buf;
+    if (hparams.no_alloc) {
+        buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0);  // 더미
+        for (t : ctx의 모든 텐서) t->buffer = buf;  // sched의 재할당 방지
+    } else {
+        buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+    }
+
+    LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", ...);
+    ggml_backend_buffer_clear(buf, 0);
+}
+```
+
+`ggml_backend_alloc_ctx_tensors_from_buft`가 하는 일: 그 buft 소속 텐서들(K/V x 레이어)의 크기를 합산 -> `buft->alloc_buffer` **1회** 호출 -> 반환된 base 주소로 각 `tensor->data = base + offset` 기록. NPU 구현에서 alloc_buffer가 "드라이버에 DRAM 영역 예약 요청"이고 **제어 메시지만 오간다** - host측 텐서 구조체가 **디바이스 주소**를 담게 되는 순간이다. `buffer_clear(buf, 0)`는 패딩 영역의 NaN 방지용 초기화(254행 주석)로, NPU에서는 device memset 커맨드다 - GB급 0 데이터를 PCIe로 보내는 것이 아니다. `hparams.no_alloc` 분기는 가중치 없이 크기만 계산하는 dry-run 경로다(257~261). 마지막으로 buft별 크기 로그(269)와 K/V 합산 로그(279~282)가 `memory_breakdown()`에 잡히는 값을 남긴다.
+
+**10. (NPU 확장) 디스크립터 등록**: 9에서 확정된 `tensor->data` 주소와 `nb` stride로 `register_kv_region` 테이블을 구성해 firmware에 1회 전달한다.
 
 ### 이 할당을 결정하는 정보의 출처: GGUF 메타데이터 vs 런타임 설정
 
