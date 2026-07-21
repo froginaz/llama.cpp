@@ -537,17 +537,19 @@ KQ_mask (그 스텝 한정의 스냅샷, 입력 텐서)  ->  forward가 소비 �
 
 7절의 상주 모델과 조작 메커니즘을 하나의 예제로 관통한다. 각 시점에서 (a) host 장부, (b) 스텝 메타데이터, (c) NPU DRAM 내용의 세 뷰를 나란히 본다.
 
-설정 (읽기 쉽게 축소): `kv_size = 16셀`(실제 8192), 창 패딩 단위 = 8(실제 256), 레이어 1개만 표시(32개 모두 동일 패턴), seq 0 하나. 프롬프트 = "what is capi tal of france ?" (7토큰).
+설정 (읽기 쉽게 축소): `kv_size = 16셀`(실제 8192), 창 패딩 단위 = 8(실제 256), **레이어 2개 표시**(l0/l1 - 나머지 30개도 동일 패턴), seq 0 하나. 프롬프트 = "what is capi tal of france ?" (7토큰). 레이어를 2개 그리는 이유: **장부는 레이어와 무관하게 1개**이고 `k_idxs` 한 벌이 모든 레이어에 공통 적용된다는 것(계약 불변식 3)을 눈으로 확인하기 위해서다.
 
 **T0. context 생성 직후**
 
 ```
-[leaf 텐서]  cache_k_l0: ne=[1024, 16, 1], data=0xNPU_BASE  <- 이후 영원히 불변
+[leaf 텐서]  cache_k_l0: ne=[1024, 16, 1], data=0xNPU_BASE           <- 이후 영원히 불변
+             cache_k_l1: ne=[1024, 16, 1], data=0xNPU_BASE+16MiB     (레이어마다 한 쌍)
 [host 장부]  cell :  0   1   2   3   4   5   6   7  ... 15
              pos  : -1  -1  -1  -1  -1  -1  -1  -1  ... -1     (전부 빈 칸)
              seq  :  {} {} {} {} {} {} {} {}  ...  {}
-             head = 0, used = 0
-[NPU DRAM]   cell :  0   0   0   0   0   0   0   0  ...  0     (memset 완료)
+             head = 0, used = 0          <- 장부는 레이어와 무관하게 1개!
+[NPU DRAM]   l0   :  0   0   0   0   0   0   0   0  ...  0     (memset 완료)
+             l1   :  0   0   0   0   0   0   0   0  ...  0
 ```
 
 **T1. prefill - `llama_decode(batch{7토큰})`**
@@ -571,8 +573,10 @@ KQ_mask (그 스텝 한정의 스냅샷, 입력 텐서)  ->  forward가 소비 �
   head = 7, used = 7
 
 [NPU DRAM - forward 후]
-  cell : K(what) K(is) K(capi) K(tal) K(of) K(france) K(?) | 0 ... 0
-         ^-- set_rows 노드가 그래프 실행 중에 기록 (V도 동일)
+  l0 : K0(what) K0(is) K0(capi) K0(tal) K0(of) K0(france) K0(?) | 0 ... 0
+  l1 : K1(what) K1(is) K1(capi) K1(tal) K1(of) K1(france) K1(?) | 0 ... 0
+       ^-- 레이어마다 set_rows 노드가 하나씩, **같은 셀 번호(k_idxs 공통)**에 기록 (V도 동일)
+       (K0과 K1은 값이 다르다 - 레이어마다 입력 hidden state가 다르므로)
 [출력]  logits 1행 -> 샘플링 -> "Paris"
 ```
 
@@ -582,7 +586,7 @@ KQ_mask (그 스텝 한정의 스냅샷, 입력 텐서)  ->  forward가 소비 �
 [메타데이터]  tokens=[Paris]  pos=[7]  k_idxs=[7]  n_kv=pad(8)=8
              KQ_mask 1행:  Paris(p7):  o o o o o o o o    <- cell 0..7 전부 보임
 [host 장부]  cell 7: pos=7, seq={0}     head = 8, used = 8
-[NPU DRAM]   cell 7: K(Paris) 기록      (cell 0..6은 읽기만 - 불변)
+[NPU DRAM]   l0: cell 7 = K0(Paris),  l1: cell 7 = K1(Paris)   (cell 0..6은 읽기만 - 불변)
 [출력]       logits 1행 -> "is"
 ```
 
@@ -593,7 +597,7 @@ KQ_mask (그 스텝 한정의 스냅샷, 입력 텐서)  ->  forward가 소비 �
              KQ_mask 1행:  is(p8):  o o o o o o o o o | x x x x x x x
                                     cell 0..8 보임      cell 9..15 빈 패딩 차단
 [host 장부]  cell 8: pos=8, seq={0}     head = 9, used = 9
-[NPU DRAM]   cell 8: K(is) 기록
+[NPU DRAM]   l0: cell 8 = K0(is),  l1: cell 8 = K1(is)
 ```
 
 `n_kv`가 8 -> 16으로 점프하는 것이 창 패딩의 실제 효과다. 풀어서 설명하면:
@@ -612,9 +616,11 @@ KQ_mask (그 스텝 한정의 스냅샷, 입력 텐서)  ->  forward가 소비 �
              pos  :  0..6           -1   -1   ... -1     <- 태그만 제거
              seq  : {0}x7            {}   {}  ...  {}
              used = 7  (head는 다음 find_slot이 빈 칸 7부터 재사용)
-[NPU DRAM]   cell 7: K(Paris)  <- 그대로 잔존!
-             cell 8: K(is)     <- 그대로 잔존!
+[NPU DRAM]   l0: cell 7 = K0(Paris), cell 8 = K0(is)   <- 그대로 잔존!
+             l1: cell 7 = K1(Paris), cell 8 = K1(is)   <- 그대로 잔존!
 [메타데이터]  (이번엔 아무것도 전송 안 됨 - PCIe 트래픽 0)
+             장부 태그 제거 1회가 **모든 레이어의 해당 셀을 동시에 무효화**한다
+             - 레이어별로 지울 것이 없다 (장부가 1개이므로)
 ```
 
 여기가 이 예제의 핵심 장면이다: 장부와 DRAM이 의도적으로 **어긋난 상태**가 된다. DRAM에는 K(Paris), K(is)가 남아 있지만 장부에 태그가 없으므로, 다음 스텝의 KQ_mask(장부에서 재파생 - 위 소절)가 cell 7, 8을 차단한다 - 결과는 "그 토큰들이 없던 세계"와 동일하다. 이후 새 토큰이 오면 find_slot이 cell 7을 재배정하고 set_rows가 **그때** 덮어쓴다 (lazy overwrite).
