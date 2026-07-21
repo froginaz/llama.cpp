@@ -533,6 +533,96 @@ KQ_mask (그 스텝 한정의 스냅샷, 입력 텐서)  ->  forward가 소비 �
 
 **dNPU 관점**: firmware는 mask를 "받아서 원소 그대로 적용"만 하면 되고, mask의 생성·최신성은 전적으로 host 책임이다. 검증할 것은 "받은 mask를 정확히 적용하는가" 하나뿐이며, 장부 -> mask 파생의 정확성은 stock llama.cpp 코드가 보장한다.
 
+### 예제로 보는 상태 전이: single sequence의 prefill -> decode -> rollback
+
+7절의 상주 모델과 조작 메커니즘을 하나의 예제로 관통한다. 각 시점에서 (a) host 장부, (b) 스텝 메타데이터, (c) NPU DRAM 내용의 세 뷰를 나란히 본다.
+
+설정 (읽기 쉽게 축소): `kv_size = 16셀`(실제 8192), 창 패딩 단위 = 8(실제 256), 레이어 1개만 표시(32개 모두 동일 패턴), seq 0 하나. 프롬프트 = "what is capi tal of france ?" (7토큰).
+
+**T0. context 생성 직후**
+
+```
+[leaf 텐서]  cache_k_l0: ne=[1024, 16, 1], data=0xNPU_BASE  <- 이후 영원히 불변
+[host 장부]  cell :  0   1   2   3   4   5   6   7  ... 15
+             pos  : -1  -1  -1  -1  -1  -1  -1  -1  ... -1     (전부 빈 칸)
+             seq  :  {} {} {} {} {} {} {} {}  ...  {}
+             head = 0, used = 0
+[NPU DRAM]   cell :  0   0   0   0   0   0   0   0  ...  0     (memset 완료)
+```
+
+**T1. prefill - `llama_decode(batch{7토큰})`**
+
+```
+[메타데이터 - host가 만들어 PCIe로 전송]
+  tokens = [what, is, capi, tal, of, france, ?]   pos = [0..6]   logits = [0,0,0,0,0,0,1]
+  k_idxs = [0, 1, 2, 3, 4, 5, 6]        <- find_slot이 배정한 셀
+  n_kv   = pad(7) = 8
+  KQ_mask (행=토큰, 열=cell 0..7):      o=보임, x=차단
+    what(p0):   o x x x x x x | x       <- causal: 자기 이전만
+    is  (p1):   o o x x x x x | x
+    ...
+    ?   (p6):   o o o o o o o | x       <- cell 7은 빈 패딩 -> 차단
+  n_outputs = 1  (마지막 토큰만 logits)
+
+[host 장부 - apply 후]
+  cell :  0    1    2    3    4    5    6    7 ... 15
+  pos  :  0    1    2    3    4    5    6   -1 ... -1
+  seq  : {0}  {0}  {0}  {0}  {0}  {0}  {0}  {} ... {}
+  head = 7, used = 7
+
+[NPU DRAM - forward 후]
+  cell : K(what) K(is) K(capi) K(tal) K(of) K(france) K(?) | 0 ... 0
+         ^-- set_rows 노드가 그래프 실행 중에 기록 (V도 동일)
+[출력]  logits 1행 -> 샘플링 -> "Paris"
+```
+
+**T2. decode 스텝 1 - "Paris" (pos 7)**
+
+```
+[메타데이터]  tokens=[Paris]  pos=[7]  k_idxs=[7]  n_kv=pad(8)=8
+             KQ_mask 1행:  Paris(p7):  o o o o o o o o    <- cell 0..7 전부 보임
+[host 장부]  cell 7: pos=7, seq={0}     head = 8, used = 8
+[NPU DRAM]   cell 7: K(Paris) 기록      (cell 0..6은 읽기만 - 불변)
+[출력]       logits 1행 -> "is"
+```
+
+**T3. decode 스텝 2 - "is" (pos 8)**
+
+```
+[메타데이터]  tokens=[is]  pos=[8]  k_idxs=[8]  n_kv=pad(9)=16  <- 패딩 경계(8)를 넘어 16으로 점프!
+             KQ_mask 1행:  is(p8):  o o o o o o o o o | x x x x x x x
+                                    cell 0..8 보임      cell 9..15 빈 패딩 차단
+[host 장부]  cell 8: pos=8, seq={0}     head = 9, used = 9
+[NPU DRAM]   cell 8: K(is) 기록
+```
+
+`n_kv`가 8 -> 16으로 점프하는 것이 창 패딩의 실제 효과다 - 창 크기가 토큰마다 변하지 않아 그래프 재사용이 유지되고, 늘어난 구간은 mask가 차단한다.
+
+**T4. rollback - `llama_memory_seq_rm(0, 7, -1)` (생성 2토큰 무르기)**
+
+```
+[host 장부]  cell :  0..6            7    8   ... 15
+             pos  :  0..6           -1   -1   ... -1     <- 태그만 제거
+             seq  : {0}x7            {}   {}  ...  {}
+             used = 7  (head는 다음 find_slot이 빈 칸 7부터 재사용)
+[NPU DRAM]   cell 7: K(Paris)  <- 그대로 잔존!
+             cell 8: K(is)     <- 그대로 잔존!
+[메타데이터]  (이번엔 아무것도 전송 안 됨 - PCIe 트래픽 0)
+```
+
+여기가 이 예제의 핵심 장면이다: 장부와 DRAM이 의도적으로 **어긋난 상태**가 된다. DRAM에는 K(Paris), K(is)가 남아 있지만 장부에 태그가 없으므로, 다음 스텝의 KQ_mask(장부에서 재파생 - 위 소절)가 cell 7, 8을 차단한다 - 결과는 "그 토큰들이 없던 세계"와 동일하다. 이후 새 토큰이 오면 find_slot이 cell 7을 재배정하고 set_rows가 **그때** 덮어쓴다 (lazy overwrite).
+
+**요약: 무엇이 언제 변하는가**
+
+| 대상 | T0 생성 | T1 prefill | T2/T3 decode | T4 rollback |
+|---|---|---|---|---|
+| leaf 구조체 (ne/nb/data 주소) | 확정 | **불변** | **불변** | **불변** |
+| host 장부 (pos/seq/head/used) | 전부 empty | +7셀 | +1셀/스텝 | **-2셀 (장부만)** |
+| 스텝 메타데이터 (idxs/mask/n_kv) | - | idxs 7개, mask 7행 | idxs 1개, mask 1행, n_kv 8->16 | 없음 (전송 0) |
+| NPU DRAM 내용 | 0 클리어 | 셀 0..6 기록 | 셀 7, 8 기록 | **불변 (잔존물)** |
+
+읽는 법: **leaf는 절대 안 변하고, DRAM은 늘어나기만 하며(forward 안의 set_rows), 장부만이 양방향(추가/제거)으로 움직인다.** 이 비대칭이 "제어는 장부, 데이터는 append-only"라는 host-visible KV의 운영 모델 그 자체다.
+
 ## 8. 기능 전체 목록과 dNPU 지원 등급
 
 | 기능 | API / 옵션 | 요구사항 등급 |
