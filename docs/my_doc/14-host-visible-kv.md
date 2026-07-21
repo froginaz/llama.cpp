@@ -295,6 +295,35 @@ end note
 
 참고: `hparams.no_alloc` 모드(실측 없이 크기만 계산하는 dry-run)에서는 6 대신 크기 0의 더미 버퍼가 붙는다 (src/llama-kv-cache.cpp:257~261).
 
+### 이 할당을 결정하는 정보의 출처: GGUF 메타데이터 vs 런타임 설정
+
+장부와 텐서는 필요한 정보의 출처가 다르고, **GGUF의 텐서 영역(가중치 데이터)은 둘 다에 전혀 필요 없다**:
+
+| 할당 대상 | 필요한 정보 | 출처 |
+|---|---|---|
+| **장부** (`v_cells`) | `kv_size`(= n_ctx), `n_seq_max`, `kv_unified` | **전부 런타임 cparams** (`-c`, `-np`) - 모델 정보 불필요. 셀은 "빈 칸 N개"일 뿐이라 모델이 뭔지 몰라도 만들 수 있다 |
+| **KV 텐서 shape** (DRAM 예약) | 레이어 수, 레이어별 n_head_kv/d_head, 레이어별 KV 유무, SWA 윈도우, MLA 여부 | **hparams = GGUF의 메타데이터 KV pair** |
+| GGUF **텐서 영역** (가중치) | - | **불필요** |
+
+생성자 코드가 이를 증명한다: 장부는 생성자 파라미터(`kv_size, n_seq_max, unified`)만으로 만들어지고(2단계), 텐서 쪽은 `hparams.has_kv(il)`(164), `hparams.n_embd_k_gqa(il)`(187), `hparams.is_mla()`(161) 등 **hparams 조회뿐** - 가중치 텐서를 들여다보는 코드는 한 줄도 없다.
+
+KV 텐서 차원과 GGUF 메타데이터 키의 대응:
+
+| 차원 | 결정하는 키 |
+|---|---|
+| 레이어 수 (텐서 몇 쌍) | `llama.block_count` |
+| ne0 = n_embd_k_gqa | `llama.attention.head_count_kv` (레이어별 배열 가능) x `llama.attention.key_length` (없으면 n_embd/n_head) |
+| V 폭 | `llama.attention.value_length` |
+| SWA 레이어의 kv_size | `llama.attention.sliding_window` |
+| MLA 특례 (V 텐서 생략 등) | deepseek 계열 `kv_lora_rank` 등 |
+| K-shift 가능 여부 | rope 타입 키 |
+| **ne1 = kv_size** | GGUF에 없음 - 런타임 `-c` |
+| **ne2 = n_stream** | GGUF에 없음 - 런타임 `-np`/`kv_unified` |
+
+개념 정리: **KV 캐시 텐서는 GGUF 파일 안에 존재하지 않는다.** GGUF의 텐서는 가중치뿐이고, `cache_k_l/v_l`은 메타데이터로부터 계산되어 로드 시점에 새로 만들어지는 런타임 산물이다. `hparams.no_alloc` dry-run이 가중치를 한 바이트도 읽지 않고 KV 크기를 보고할 수 있는 것(위 참고)이 이 분리의 실증이다.
+
+**dNPU 함의**: KV 사이징과 장부 구축에는 constructor ELF도 weight_info도 필요 없다 - GGUF 메타데이터 키만 정확하면 된다. 뒤집으면, **GGUF의 attention 관련 키들이 ELF 안의 실제 topology와 일치하는 것이 KV 계약의 전제**다. n_head_kv나 key_length가 어긋나면 host가 예약한 행 폭과 firmware가 기대하는 레이아웃이 조용히 어긋난다 - 2절/핸드오프에서 권장한 "topology 해시를 GGUF kv에 넣고 load 시 교차 검증"이 KV 관점에서도 필수인 이유다.
+
 ### 무엇이 어디에 사는가
 
 | 위치 | 있는 것 | 없는 것 |
