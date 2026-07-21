@@ -596,7 +596,14 @@ KQ_mask (그 스텝 한정의 스냅샷, 입력 텐서)  ->  forward가 소비 �
 [NPU DRAM]   cell 8: K(is) 기록
 ```
 
-`n_kv`가 8 -> 16으로 점프하는 것이 창 패딩의 실제 효과다 - 창 크기가 토큰마다 변하지 않아 그래프 재사용이 유지되고, 늘어난 구간은 mask가 차단한다.
+`n_kv`가 8 -> 16으로 점프하는 것이 창 패딩의 실제 효과다. 풀어서 설명하면:
+
+- **n_kv는 값이 아니라 그래프 안 텐서들의 shape이다**: K view `[d, n_kv]`, KQ_mask `[n_kv, n_tokens]`, scores `[n_kv, ...]`. n_kv가 바뀌면 텐서 모양이 바뀌고, 곧 다른 그래프가 필요하다.
+- **패딩이 없다면**: decode는 매 스텝 셀이 1개씩 늘므로 n_kv = 8, 9, 10, ... 매 스텝 shape이 달라져 `can_reuse`가 항상 실패 - **토큰 하나마다 그래프 재빌드 + sched 재할당**을 하게 된다.
+- **패딩을 하면**: n_kv를 "사용량을 덮는 다음 패딩 배수"로 잡아 8 -> 16으로 점프시킨 뒤, 사용 셀이 16을 넘을 때까지 **쭉 16으로 고정**한다. 그동안 shape이 동일하므로 재사용 경로(입력만 교체)를 타고, 재빌드는 패딩 경계를 넘는 순간(실값 기준 256토큰에 1회)만 일어난다.
+- **늘어난 구간(빈 셀 9..15)은 mask가 -inf로 차단**하므로 softmax 가중치 0 - 결과에 기여하지 못한다. 비용은 빈 셀 몇 개의 헛계산, 이득은 재빌드 1/256. (창 폭이 커널 친화적 배수로 고정되어 일부 백엔드 성능에도 유리 - src/llama-kv-cache.cpp:1138~1139 주석)
+
+비유: 회의 인원이 9명일 때 9인실을 잡으면 10명이 되는 순간 방을 옮겨야 한다. 처음부터 16인실을 잡으면 16명까지 방을 안 바꾸고, 빈 의자는 비워 두면 된다 - "방 옮기기" = 그래프 재빌드, "빈 의자" = mask가 차단하는 패딩 셀.
 
 **T4. rollback - `llama_memory_seq_rm(0, 7, -1)` (생성 2토큰 무르기)**
 
@@ -622,6 +629,75 @@ KQ_mask (그 스텝 한정의 스냅샷, 입력 텐서)  ->  forward가 소비 �
 | NPU DRAM 내용 | 0 클리어 | 셀 0..6 기록 | 셀 7, 8 기록 | **불변 (잔존물)** |
 
 읽는 법: **leaf는 절대 안 변하고, DRAM은 늘어나기만 하며(forward 안의 set_rows), 장부만이 양방향(추가/제거)으로 움직인다.** 이 비대칭이 "제어는 장부, 데이터는 append-only"라는 host-visible KV의 운영 모델 그 자체다.
+
+### 예제 확장: 기능별 시나리오 (speculative / seq_cp / session / multi-sequence)
+
+위 예제의 T3 종료 상태(cell 0..8 = seq 0의 "...france ? Paris is", head=9)에서 각 기능이 어떻게 동작하는지 이어서 본다. 네 시나리오는 서로 독립이다 (각각 T3에서 출발).
+
+**E1. speculative decoding - rollback의 실전 사용**
+
+draft(작은 모델 또는 MTP)가 다음 3토큰 "the capital of"를 제안했다고 하자. target 모델은 이를 **폭 3짜리 batch 1회**로 병렬 검증한다:
+
+```
+[검증 batch]  tokens=[the, capital, of]  pos=[9,10,11]  k_idxs=[9,10,11]  logits=[1,1,1]
+[forward 후]  DRAM: cell 9=K(the), 10=K(capital), 11=K(of)
+              logits 3행 <- 각 위치에서 target이 원하는 다음 토큰 확인
+[판정]        pos9 "the" 수락, pos10 "capital" 수락, pos11에서 target은 "city"를 원함 -> "of" 거부
+[rollback]    llama_memory_seq_rm(0, 11, -1)
+              장부: cell 11 -> pos=-1, seq={}     DRAM: K(of) 잔존 (mask가 차단)
+[다음 batch]  target이 뽑은 "city"를 pos 11로 decode (find_slot이 cell 11 재배정 -> 덮어씀)
+```
+
+포인트: 순차 decode 3회가 **병렬 검증 1회**로 줄고(수락 시 3배 가속), 거부의 비용은 **장부 1셀 해제**뿐이다. T4에서 본 rollback이 speculative의 핵심 원자 연산인 이유다.
+
+**E2. seq_cp - 복사 없는 프롬프트 공유**
+
+시스템 프롬프트가 seq 0의 cell 0..6에 prefill돼 있고, 새 대화 seq 1이 같은 프리픽스에서 시작한다:
+
+```
+[호출]        llama_memory_seq_cp(mem, 0, 1, 0, 7)   // pos 0..6 구간
+[장부]        cell :  0    1    ...   6      <- 같은 셀에 태그만 추가
+              seq  : {0,1} {0,1} ... {0,1}       (seq[i]가 비트셋이라 가능)
+[DRAM]        불변 - 물리 K/V는 한 벌 그대로       [PCIe] 0
+[이후]        seq 1의 질문 토큰들은 새 셀(9..)에 기록되고,
+              seq 1의 mask 행 = cell 0..6(공유 구간) + 자기 셀들만 o
+```
+
+포인트: "복사(copy)"라는 이름과 달리 unified KV에서는 **비트셋 태그 추가**가 전부다. N개 슬롯이 같은 시스템 프롬프트를 공유해도 물리 K/V는 한 벌이다.
+
+**E3. session save / restore - 유일하게 KV가 PCIe를 건너는 경로**
+
+```
+[save]        llama_state_seq_save_file(ctx, "seq0.bin", 0, ...)
+  1. 장부에서 seq 0의 셀 목록을 pos 순으로 수집: [0,1,...,8]
+  2. get_tensor로 해당 행들만 DMA: 9셀 x 4KB(K+V) x 32레이어 = ~1.1 MB
+  3. 파일 = { 토큰/pos 메타데이터 + pos 순으로 직렬화된 K/V 행들 }
+     <- **셀 번호는 저장하지 않는다** (위치 독립적)
+[restore]     (다른 context, 심지어 재시작 후라도 - 같은 모델이면)
+  1. find_slot이 **새 셀**을 배정 (예: cell 40..48 - 번호가 달라도 무관)
+  2. set_tensor로 K/V 행 주입 (host -> device DMA)
+  3. 장부에 pos 0..8, seq={0} 태그 재구성
+```
+
+포인트: 저장물이 "pos 순 행 데이터"라 **셀 번호에 독립적**이다 - 복원 시 어느 셀에 놓이든 장부와 mask가 의미를 복원한다. 6장 트래픽 표에서 "KV가 PCIe를 건너는 유일한 경우"가 바로 이 MB급 DMA다.
+
+**E4. multi-sequence - 섞인 batch와 mask 격리**
+
+새 대화 seq 1("who is best soccer player ?", 6토큰)이 도착해 한 context에서 두 대화가 함께 돈다:
+
+```
+[seq1 prefill] k_idxs=[9..14] -> 장부: cell 9..14 = seq{1}, pos 0..5
+[장부]        cell :  0..8         9..14        15...
+              소유 :  seq0(9셀)    seq1(6셀)    빈 칸
+[공동 decode] batch{2토큰} = [seq0의 다음(pos 9), seq1의 다음(pos 6)]
+              k_idxs=[15, 16]
+              KQ_mask:
+                seq0 토큰 행:  cell 0..8 o, 15 o  | cell 9..14 x  <- seq1 차단
+                seq1 토큰 행:  cell 9..14 o, 16 o | cell 0..8  x  <- seq0 차단
+[forward]     그래프 1회로 두 대화가 동시에 1토큰씩 전진 (가중치 1회 읽기 공유)
+```
+
+포인트: 두 대화의 셀이 물리적으로 이웃해 있어도(9..14 vs 0..8) **mask 행이 서로를 차단**하므로 수학적으로 완전 격리다. firmware는 여기서도 seq_id를 모른다 - dNPU의 남은 관문이 "섞인 ubatch를 받는 batch API"뿐인 이유가 이 그림에 있다 (13번 문서 2장의 두 대화 예제와 같은 상황).
 
 ## 8. 기능 전체 목록과 dNPU 지원 등급
 
