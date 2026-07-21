@@ -13,13 +13,43 @@ box "NPU 보드" #FFF7E0
   participant "NPU DRAM\n(weights + KV 상주)" as DRAM
 end box
 
-== 0. 로드/생성 시 1회 ==
-C -> B : 가중치 업로드 (GGUF 텐서)
+== 0-a. 모델 로드: 가중치 업로드 (1회) ==
+C -> B : 가중치 텐서 로드 (GGUF)
 B -> P : DMA host -> device (수 GB, 1회)
 P -> DRAM : weights 상주
-C -> B : KV 텐서 할당 (NPU buft)
-B -> DRAM : 영역 예약만 (데이터 전송 없음)
-C -> B : register_kv_region x 32레이어\n(디스크립터만, ~KB)
+
+== 0-b. context 생성: 장부 할당 (host, PCIe 무관) ==
+C -> MEM : llama_kv_cache 생성자:\nv_cells[s].resize(kv_size=8192)\nv_heads = 0, seq_to_stream 매핑
+note right of MEM
+  장부의 실체 = host RAM의 배열들
+  (셀당 pos 1개 + seq 비트셋, 셀당 ~16B
+   -> 8192셀 x 1스트림 = 수백 KB 수준)
+  전 셀 empty로 시작. PCIe 트래픽 0.
+  (src/llama-kv-cache.cpp:135~153)
+end note
+
+== 0-c. context 생성: DRAM 상주 공간 예약 (control-plane만) ==
+C -> C : buft별 ggml_context 생성\n(no_alloc=true, 텐서 메타데이터 풀 - host RAM)
+C -> C : 레이어별 ggml_new_tensor_3d(k/v)\nne/nb만 설정, data = null\n(src/llama-kv-cache.cpp:211)
+note right of C
+  buft 선택: offload_kqv=true면 해당 레이어
+  디바이스(dev_layer)의 buffer type,
+  false면 CPU buft (= KV를 host RAM에)
+  (src/llama-kv-cache.cpp:190~199)
+end note
+C -> B : ggml_backend_alloc_ctx_tensors_from_buft\n(텐서 크기 합산 -> alloc_buffer 1회 호출)\n(src/llama-kv-cache.cpp:263)
+B -> P : 드라이버 커맨드: DRAM 영역 예약 요청\n(제어 메시지뿐 - 데이터 전송 없음)
+P -> DRAM : 1 GiB 영역 예약 -> base 주소 반환
+B --> C : 각 tensor->data = base + offset\n(host측 텐서 구조체에 **디바이스 주소** 기록)
+C -> B : ggml_backend_buffer_clear(buf, 0)\n(src/llama-kv-cache.cpp:271)
+B -> FW : device memset 커맨드
+FW -> DRAM : 0으로 초기화 (보드 내부 - 패딩 NaN 방지)
+C -> C : "KV buffer size = 1024.00 MiB" 로그\n-> memory_breakdown에 반영
+
+== 0-d. NPU 확장: 디스크립터 등록 ==
+C -> B : register_kv_region x 32레이어\n(위에서 확정된 tensor->data 주소 + nb stride로 구성, ~KB)
+B -> P : 디스크립터 테이블 전달 (~KB)
+P -> FW : firmware가 KV 영역 주소/stride 인지
 
 == 1. decode 스텝 - 정상 경로: KV는 PCIe를 건너지 않는다 ==
 App -> C : llama_decode(batch{n_tokens=2})
