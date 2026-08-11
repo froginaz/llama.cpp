@@ -487,6 +487,28 @@ KV 텐서 차원과 GGUF 메타데이터 키의 대응:
 - **"host가 필요시 get_tensor로 일부를 가져온다"** - 맞지만 그 "필요시"는 **session save 때뿐**이다. 일상 추론 경로에서 host는 KV 데이터를 절대 읽지 않고, save 시에도 임시 버퍼로 DMA해 직렬화한 뒤 사본을 유지하지 않는다.
 - **"스텝별로 stack된다"** - 할당이 자라는 것이 아니라 **선할당된 셀에 행을 기록**하는 것이다. VRAM 사용량은 context 생성 순간 고정이고, 스텝마다 변하는 것은 "채워진 셀 수"라는 장부상의 상태뿐이다.
 
+### 구현 레이아웃 노트: 장부의 실제 자료구조는 SoA다
+
+이 문서의 장부 그림들은 "cell i의 레코드 = {pos, seq}"라는 **AoS(array of structs) 논리 뷰**로 그려져 있다. 실제 `llama_kv_cells`의 구현은 **SoA(struct of arrays)** - 필드별 병렬 배열이다 (src/llama-kv-cells.h:458~499):
+
+```cpp
+bool has_shift = false;
+std::set<uint32_t>              used;                    // 462: 사용 중 셀 "집합" (카운트 아님)
+std::vector<llama_pos>          pos;                     // 464: pos[i] = 셀 i의 위치 (-1 = 빈 칸)
+std::vector<llama_kv_cell_ext>  ext;                     // 467: M-RoPE 2D 좌표
+std::vector<llama_pos>          shift;                   // 484: 미적용 K-shift 누적분
+std::vector<seq_set_t>          seq;                     // 489: 셀당 bitset<LLAMA_MAX_SEQ>
+std::map<llama_pos, int>        seq_pos[LLAMA_MAX_SEQ];  // 499: seq별 pos -> 등장 횟수
+```
+
+담긴 정보는 논리 뷰와 동일하고 **접근 방향만 전치**된 것이다 - mask 생성처럼 한 필드만 훑는 스캔이 많아 캐시 효율상 SoA가 유리하다. 다만 세부적으로 정확히 해 둘 것 세 가지:
+
+1. **`used`는 카운트가 아니라 `std::set<uint32_t>`** (사용 셀 인덱스 집합)이다. 아래 예제의 `used = {0..8}` 표기가 정확한 형태고, 개수가 필요하면 `used.size()`다.
+2. **`seq_pos`는 "pos 집합"이 아니라 `map<pos, count>`**다 - 495행 주석이 이유를 밝힌다: "같은 seq에서 같은 pos가 두 번 이상 나올 수 있다". `seq_pos_min/max` 조회를 O(log n)으로 만드는 보조 색인이다.
+3. **`v_heads`는 장부(상태)의 일부가 아니다** - 헤더 주석(src/llama-kv-cache.h:263~264)이 명시한다: "not part of the KV state, only used to speed-up find_slot". session save에도 저장되지 않는 순수 탐색 힌트이며, 예제 그림에 head를 함께 그린 것은 편의상이다.
+
+**모델과의 접촉면도 여기서 확인해 둘 가치가 있다**: 모델 코드(build_arch_graph)는 이 클래스를 직접 호출하지 않는다. 접촉은 `llm_graph_context::build_attn` 안의 5개 호출 - `cpy_k/cpy_v`(set_rows 쓰기 노드 삽입, src/llama-graph.cpp:2309~2310), `get_k/get_v`(창 view, 2316~2317), `build_attn_inp_kv()`(idxs/mask 입력 준비) - 이 전부다. 셀/장부/find_slot은 모델에게 완전히 불투명하며, dNPU Phase 2(개별 op)가 재현해야 할 계약이 바로 이 5개 호출의 의미론이다.
+
 ### 조작별 분해: "장부 편집 + (필요시) 디바이스 작업"
 
 모든 KV 조작은 이 공식으로 분해된다:
@@ -547,7 +569,7 @@ KQ_mask (그 스텝 한정의 스냅샷, 입력 텐서)  ->  forward가 소비 �
 [host 장부]  cell :  0   1   2   3   4   5   6   7  ... 15
              pos  : -1  -1  -1  -1  -1  -1  -1  -1  ... -1     (전부 빈 칸)
              seq  :  {} {} {} {} {} {} {} {}  ...  {}
-             head = 0, used = 0          <- 장부는 레이어와 무관하게 1개!
+             head = 0, used = {}         <- 장부는 레이어와 무관하게 1개!
 [NPU DRAM]   l0   :  0   0   0   0   0   0   0   0  ...  0     (memset 완료)
              l1   :  0   0   0   0   0   0   0   0  ...  0
 ```
@@ -570,7 +592,7 @@ KQ_mask (그 스텝 한정의 스냅샷, 입력 텐서)  ->  forward가 소비 �
   cell :  0    1    2    3    4    5    6    7 ... 15
   pos  :  0    1    2    3    4    5    6   -1 ... -1
   seq  : {0}  {0}  {0}  {0}  {0}  {0}  {0}  {} ... {}
-  head = 7, used = 7
+  head = 7, used = {0..6}
 
 [NPU DRAM - forward 후]
   l0 : K0(what) K0(is) K0(capi) K0(tal) K0(of) K0(france) K0(?) | 0 ... 0
@@ -585,7 +607,7 @@ KQ_mask (그 스텝 한정의 스냅샷, 입력 텐서)  ->  forward가 소비 �
 ```
 [메타데이터]  tokens=[Paris]  pos=[7]  k_idxs=[7]  n_kv=pad(8)=8
              KQ_mask 1행:  Paris(p7):  o o o o o o o o    <- cell 0..7 전부 보임
-[host 장부]  cell 7: pos=7, seq={0}     head = 8, used = 8
+[host 장부]  cell 7: pos=7, seq={0}     head = 8, used = {0..7}
 [NPU DRAM]   l0: cell 7 = K0(Paris),  l1: cell 7 = K1(Paris)   (cell 0..6은 읽기만 - 불변)
 [출력]       logits 1행 -> "is"
 ```
@@ -596,7 +618,7 @@ KQ_mask (그 스텝 한정의 스냅샷, 입력 텐서)  ->  forward가 소비 �
 [메타데이터]  tokens=[is]  pos=[8]  k_idxs=[8]  n_kv=pad(9)=16  <- 패딩 경계(8)를 넘어 16으로 점프!
              KQ_mask 1행:  is(p8):  o o o o o o o o o | x x x x x x x
                                     cell 0..8 보임      cell 9..15 빈 패딩 차단
-[host 장부]  cell 8: pos=8, seq={0}     head = 9, used = 9
+[host 장부]  cell 8: pos=8, seq={0}     head = 9, used = {0..8}
 [NPU DRAM]   l0: cell 8 = K0(is),  l1: cell 8 = K1(is)
 ```
 
@@ -615,7 +637,7 @@ KQ_mask (그 스텝 한정의 스냅샷, 입력 텐서)  ->  forward가 소비 �
 [host 장부]  cell :  0..6            7    8   ... 15
              pos  :  0..6           -1   -1   ... -1     <- 태그만 제거
              seq  : {0}x7            {}   {}  ...  {}
-             used = 7  (head는 다음 find_slot이 빈 칸 7부터 재사용)
+             used = {0..6}  (head는 다음 find_slot이 빈 칸 7부터 재사용)
 [NPU DRAM]   l0: cell 7 = K0(Paris), cell 8 = K0(is)   <- 그대로 잔존!
              l1: cell 7 = K1(Paris), cell 8 = K1(is)   <- 그대로 잔존!
 [메타데이터]  (이번엔 아무것도 전송 안 됨 - PCIe 트래픽 0)
