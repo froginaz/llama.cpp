@@ -49,6 +49,7 @@ One-line summary: **"a llama-cli / llama-simple grade single-sequence path in wh
 | **Host-visible KV** | **Full implementation plan in section 5 of this document.** Background: doc 13 ch.6 (cell model: K-vector width x cell count x streams), the KV state tables in the deep-dive diagrams (meaning of find_slot/apply), doc 12 buft/buffer ownership (who allocates/frees) |
 | Features unlocked by visible KV (use as a verification checklist) | Doc 13 ch.5: seq_cp prompt sharing, session save/restore, llama-server slot-cache reuse |
 | **Standard GGUF template + per-op support** (Phase 2) | Docs 01~05 (GGUF -> hparams -> build_graph -> cgraph pipeline), `tests/test-backend-ops.cpp` (per-op correctness) - CPU fallback / partial offload / op-level verification only come alive at this stage |
+| **SWA / hybrid model support** (later) | [Doc 15](15-swa-and-hybrid-kv.md) (Korean): the iSWA two-cache composition (free once the host-visible KV contract holds), lazy cell expiry, rollback limits + server checkpoints, and the recurrent state model (needs an extra fixed-size read-modify-write contract beyond KV) |
 
 **Note on gateway ordering**: opening the batch API first yields "multiple conversations batched per pass but KV still in firmware", which forces the firmware to reproduce per-seq cell tagging and mask isolation internally (a firmware clone of doc 13's unified-KV model). Opening visible KV first lets llama.cpp's existing memory module be reused as-is, shifting the burden to host-side verification - **visible-KV-first reuses more llama.cpp infrastructure**.
 
@@ -236,5 +237,5 @@ Caveats:
 
 1. From this document, jump via the section-3 map to the documents for the key feature being started (first time: full reading order in section 6, ~30 minutes). For the host-visible KV migration specifically, execute the plan in section 5.
 2. Skim the decision timeline: `git log --oneline -- docs/my_doc`.
-3. Do the NPU work **on a branch in your own environment** (never push to this repo). If you add documents, continue the numbering from 15 (14 is taken by the host-visible KV doc), and maintain your own README index - your documents will not come back to this repo either.
+3. Do the NPU work **on a branch in your own environment** (never push to this repo). If you add documents, continue the numbering from 16 (14 = host-visible KV, 15 = SWA/hybrid are taken), and maintain your own README index - your documents will not come back to this repo either.
 4. When this repo's work is updated, receive it via the incremental bundle of section 9. No conflict risk: this side only touches `docs/my_doc/`, the NPU code lives under `ggml/src/`.
