@@ -5,6 +5,7 @@
 PlantUML 원본:
 
 - [13-sequence-decode-batch2-single-context.puml](13-sequence-decode-batch2-single-context.puml) - batch size 2 decode 상세 시퀀스 다이어그램 (단일 컨텍스트, 기본형)
+- [13-sequence-decode-batch1-single-context-detailed.puml](13-sequence-decode-batch1-single-context-detailed.puml) - 상세 주석판의 최소형: **sequence 1개, batch size 1** decode. batched=false 분기, 단일 seq의 mask(causal만), memory-bound 특성 등 batch2와의 차이를 명시. 14번 문서 상태 전이 예제의 T2와 동일 상황
 - [13-sequence-decode-batch2-single-context-detailed.puml](13-sequence-decode-batch2-single-context-detailed.puml) - 위 기본형의 상세 주석판: 두 대화 예제 연동, 함수별 역할 설명, 텐서 shape 흐름, KV 캐시 메모리 레이아웃, 변수 용어 표 포함
 - [13-sequence-prefill-2seq-single-context-detailed.puml](13-sequence-prefill-2seq-single-context-detailed.puml) - 상세 주석판의 prefill 편: 서로 다른 두 대화(13토큰)를 한 pass로 prefill하는 과정. causal+seq 격리 mask, get_rows에 의한 13->2 출력 축소, compute-bound vs memory-bound 비교. decode 주석판의 "이전 단계"에 해당
 - [13-sequence-decode-batch2-multi-context.puml](13-sequence-decode-batch2-multi-context.puml) - batch size 2 decode 상세 시퀀스 다이어그램 (멀티 컨텍스트)
