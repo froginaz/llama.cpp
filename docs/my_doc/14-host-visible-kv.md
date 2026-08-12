@@ -583,6 +583,38 @@ KQ_mask (그 스텝 한정의 스냅샷, 입력 텐서)  ->  forward가 소비 �
 
 **dNPU 관점**: firmware는 mask를 "받아서 원소 그대로 적용"만 하면 되고, mask의 생성·최신성은 전적으로 host 책임이다. 검증할 것은 "받은 mask를 정확히 적용하는가" 하나뿐이며, 장부 -> mask 파생의 정확성은 stock llama.cpp 코드가 보장한다.
 
+### 왜 mask만으로 충분한가: score = q·K + mask 의 수학
+
+앞 절이 "mask가 장부에서 재파생된다"는 **메커니즘**이었다면, 이 절은 그것이 device 수정 없이 성립하는 **수학적 근거**다. 핵심은 device의 attention 커널이 이미 mask를 덧셈 항으로 소비하는 표준 연산이라는 것이다 (src/llama-graph.cpp:2126):
+
+```cpp
+kq = ggml_mul_mat(ctx0, k, q);                    // score = q · K^T
+kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
+                                                  // softmax(score * scale + mask)
+```
+
+인과 사슬을 끝까지 따라가면:
+
+1. **mask는 device가 계산하는 값이 아니라 host가 매 스텝 채워 넣는 입력 텐서다** (앞 절). device 입장에서는 그저 또 하나의 입력일 뿐이다.
+2. device가 실행하는 것은 `softmax(q·Kᵀ·scale + mask)` - 표준 attention 그 자체다. **새 커널이 필요 없다.**
+3. mask가 `-inf`인 열 j는 `exp(-inf) = 0`이 되어 softmax 가중치가 정확히 0이 된다. 그 셀의 V가 출력에 기여하는 양도 0이다.
+4. 가중치가 0이면 **셀 j의 K/V 실제 바이트가 무엇이든 - 유효한 값이든, 지워진 seq의 잔재든, 쓰레기든 - 결과가 수학적으로 동일**하다. 이것이 3장 불변식 "셀은 절대 0으로 지우지 않는다"의 근거다.
+
+`seq_rm`을 이 사슬로 다시 읽으면:
+
+```
+host:      장부에서 셀 5의 seq 태그 제거          (device 통신 0)
+다음 스텝: mask 재파생 → mask[·][5] = -inf        (연산상 존재하지 않는 셀)
+이후:      find_slot이 셀 5를 빈 칸으로 재배정
+           → 새 토큰의 K/V가 set_rows로 그냥 덮어씀  (지우기 단계 없음)
+```
+
+즉 "어떤 셀이 보이는가"에 관한 모든 조작(reuse/sharing/rewind/remove - 매핑 표의 A 행 전부)은 device 입장에서 **입력 텐서 값이 달라진 것에 불과**하다.
+
+**단서 1 - 전제조건**: "device 수정 0"은 firmware attention이 host가 준 `KQ_mask`(그리고 `k_idxs`/`v_idxs`)를 실제로 소비하는 상태, 즉 **visible KV 계약이 이미 성립한 이후** 기준이다. Phase-1처럼 firmware가 KV를 내부에서 자체 관리하고 mask 입력을 받지 않는 구조에서는 A등급 조작도 불가능하다. A등급의 정확한 뜻은 "계약 성립 후에는 **추가** firmware 작업이 0"이다.
+
+**단서 2 - mask로 안 되는 것이 B등급의 존재 이유다**: mask가 할 수 있는 일은 셀을 켜고 끄는 이진 선택(0 / -inf)뿐이다. `seq_add`(pos 이동)는 캐시된 K에 이미 구워진(baked) RoPE 회전각을 바꿔야 하는 문제라 K 바이트 자체의 재계산이 필요하다(`build_graph_shift`, src/llama-kv-cache.cpp:798). --context-shift, --keep 같은 행들이 B(K-shift 커널)로 분류된 이유가 이것이다.
+
 ### 예제로 보는 상태 전이: single sequence의 prefill -> decode -> rollback
 
 7절의 상주 모델과 조작 메커니즘을 하나의 예제로 관통한다. 각 시점에서 (a) host 장부, (b) 스텝 메타데이터, (c) NPU DRAM 내용의 세 뷰를 나란히 본다.
