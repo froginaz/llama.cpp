@@ -365,6 +365,69 @@ SWA 레이어:  2 x n_layer_swa  x size_swa x (n_head_kv x d_head) x type_size
 
 `--swa-full` 옵션(iswa.cpp:53~58)은 SWA 캐시도 풀사이즈로 만든다 - 5장의 rollback 제약을 없애는 대신 메모리 절감을 포기하는 트레이드오프다.
 
+### KQ_mask는 레이어당이 아니라 캐시당 1장이다
+
+"full 레이어와 SWA 레이어는 mask 크기가 다를 텐데, host는 이를 어떻게 관리해 텐서로 주는가?"라는 질문에 대한 답이다. 직관적으로는 `KQ_mask[layer][...]` 같은 레이어별 배열을 상상하게 되지만, 실제로는 **그래프 전체에 mask 입력 텐서가 딱 2장**(base용 + SWA용)이고 각 레이어는 자기 종류에 맞는 쪽을 공유 참조한다.
+
+**왜 레이어 축이 필요 없는가**: 같은 캐시에 속한 레이어들은 "어떤 셀이 보이는가"가 완전히 동일하다. 장부가 캐시당 1개이고 `k_idxs` 한 벌이 전 레이어 공통인 것(14장 계약 불변식 3)과 같은 원리다. 따라서 mask도 캐시 단위로만 갈라진다.
+
+**생성 - 캐시별로 한 벌씩** (`build_attn_inp_kv_iswa`, src/llama-graph.cpp:2686):
+
+```cpp
+// base 캐시용 한 벌
+inp->self_kq_mask     = build_attn_inp_kq_mask(ctx0, mctx_cur->get_base(), ubatch, cparams);
+// SWA 캐시용 한 벌
+inp->self_kq_mask_swa = build_attn_inp_kq_mask(ctx0, mctx_cur->get_swa(),  ubatch, cparams);
+```
+
+폭을 결정하는 것은 각 캐시 자신의 `get_n_kv()`다 (llama-graph.cpp:24~30). `k_idxs`/`v_idxs`도 캐시별 별도 한 벌이므로, **14장의 visible KV 계약 입력 세트(mask + k_idxs + v_idxs) 전체가 캐시 단위로 2벌** 존재하는 셈이다:
+
+```
+그래프 입력 (iSWA 모델의 attention 관련)
+├── inp_KQ_mask       [n_kv_base, n_tokens, 1, n_stream]   ← base 캐시에서 파생
+├── inp_KQ_mask_swa   [n_kv_swa,  n_tokens, 1, n_stream]   ← SWA 캐시에서 파생
+├── inp_k_idxs / inp_v_idxs           (base 캐시용)
+└── inp_k_idxs_swa / inp_v_idxs_swa   (SWA 캐시용)
+```
+
+**shape 주의 2가지** (llama-graph.h:445~448 주석):
+
+1. **ne0은 n_ctx/size_swa가 아니라 동적 n_kv다.** `n_kv = GGML_PAD(used_max_p1, 256)` - 상한이 n_ctx(base) / size_swa(SWA)일 뿐, 실제 폭은 매 스텝 장부에서 계산되는 활성 창이다. n_ctx=131072라도 현재 900셀만 쓰이면 base mask의 ne0은 1024다. SWA 쪽은 이 값이 size_swa(위 예에서 4,608)를 넘을 수 없어 항상 작게 유지된다.
+2. **mask는 1차원 셀 벡터가 아니라 [셀 x 쿼리 토큰] 행렬이다.** ne1 = 이번 ubatch의 토큰 수 - decode(1토큰)면 ne1=1, prefill 512토큰이면 ne1=512. ne3은 비통합 모드의 스트림 축이다.
+
+**레이어와 mask의 연결 - 토폴로지에 고정** (`build_attn` iSWA 오버로드, llama-graph.cpp:2522, 2568):
+
+```cpp
+const bool is_swa = hparams.is_swa(il);
+const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
+```
+
+이 선택은 그래프 구축 시 1회 일어나 attention 노드의 배선으로 굳는다. 레이어 32개 모델이라도 mask는 2장이고, SWA 레이어 전부가 `self_kq_mask_swa` 하나를, full 레이어 전부가 `self_kq_mask` 하나를 가리킨다. 런타임 분기는 없다.
+
+**값 채우기 - 캐시별 장부에서 각자 파생** (`llm_graph_input_attn_kv_iswa::set_input`, llama-graph.cpp:563~578):
+
+```cpp
+mctx->get_base()->set_input_kq_mask(self_kq_mask,     ubatch, causal);  // base 장부 기준
+mctx->get_swa() ->set_input_kq_mask(self_kq_mask_swa, ubatch, causal);  // SWA 장부 기준
+```
+
+실행 코드는 둘 다 동일한 `set_input_kq_mask_impl`이지만 입력 장부가 다르다 - iSWA는 캐시 2개의 합성이므로 장부(`v_cells`)도 2개다. 차이는 생성자 인자에서 온다: SWA 인스턴스는 `hparams.n_swa`와 `swa_type`을 받아 만들어져(iswa.cpp:72) mask 파생 시 인과 조건에 **창 조건이 추가로** 적용되고, base 인스턴스는 `n_swa=0, SWA_TYPE_NONE`(iswa.cpp:65)이라 순수 인과 mask만 나온다. 14장의 "mask는 저장물이 아니라 파생물" 원리가 캐시별로 독립 적용되는 것뿐이다.
+
+그래프 재사용도 mask별로 따로 검사한다 - `can_reuse`(llama-graph.cpp:597~621)가 base/SWA 각각 `can_reuse_kq_mask`를 호출하며, 각 캐시의 256 배수 창 패딩 덕에 ne0이 토큰마다 튀지 않아 재사용이 유지된다.
+
+**경계 사례**: `set_input`이 `self_k_idxs && self_k_idxs->buffer` 같은 널/버퍼 체크를 하는 이유는, 어느 한쪽 종류의 레이어가 아예 없는 모델이면 해당 벌이 할당되지 않기 때문이다. 그 경우 입력은 1벌만 존재한다. 일반(비-SWA) 모델은 애초에 단일 캐시라 mask 1장이 전부다.
+
+정리:
+
+| | base mask | SWA mask |
+|---|---|---|
+| 텐서 | `self_kq_mask` 1장 | `self_kq_mask_swa` 1장 |
+| 폭 (ne0) | base 캐시의 `get_n_kv()` (≤ n_ctx) | SWA 캐시의 `get_n_kv()` (≤ size_swa) |
+| 값의 출처 | base 장부 + 인과 조건 | SWA 장부 + 인과 조건 + 창 조건 |
+| 소비자 | `is_swa(il)==false`인 모든 레이어 | `is_swa(il)==true`인 모든 레이어 |
+
+**dNPU 함의**: firmware가 받는 per-step 입력이 `tokens, pos, mask 2장, idxs 2벌`이 된다. 내부 attention에서 레이어 종류별로 어느 mask/idxs를 쓸지는 topology(weight_info)에 박아두면 되고 런타임 분기가 필요 없다. mask를 원소 그대로 적용하기만 하면 된다는 14장의 계약("생성·최신성은 host 책임")도 두 장 모두에 그대로 성립한다.
+
 ## 4. SWA 셀의 생애: 별도 프루닝 패스는 없다 (lazy 만료)
 
 "창 밖으로 벗어난 셀을 누가 언제 지우는가?"에 대한 답이 우아하다: **아무도 지우지 않는다. find_slot이 "만료된 셀"을 빈 칸처럼 재사용할 뿐이다** (src/llama-kv-cache.cpp:979~986):
