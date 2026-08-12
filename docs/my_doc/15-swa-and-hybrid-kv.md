@@ -334,6 +334,33 @@ uint32_t size_swa = GGML_PAD(std::min(size_base,
 
 **SWA 캐시 크기 공식**이 핵심이다: `n_swa x n_seq + n_ubatch` - 창을 유지할 만큼 + 이번 배치가 들어갈 여유분. 예: n_swa=1024, n_seq=4, n_ubatch=512면 SWA 레이어당 4,608셀(패딩 후) - n_ctx=131072짜리 base 캐시의 3.5%다. 14번 문서 생성 과정의 `filter` 콜백(5단계)이 바로 이 레이어 분배에 쓰인다.
 
+### 크기 공식 해부: 왜 n_swa가 아니라 n_swa x n_seq + n_ubatch 인가
+
+직관적으로는 "창이 n_swa 토큰이니 SWA 캐시도 n_swa 셀이면 되지 않나"라고 기대하게 된다. 바이트 비용으로 쓰면:
+
+```
+표준 레이어:  2 x n_layer_base x n_ctx    x (n_head_kv x d_head) x type_size
+SWA 레이어:  2 x n_layer_swa  x size_swa x (n_head_kv x d_head) x type_size
+                               ~~~~~~~~
+                               = PAD(min(n_ctx, n_swa x n_seq + n_ubatch), 256)
+```
+
+`n_swa` 자리에 순수한 `n_swa`가 아니라 `size_swa`가 들어가는 이유는 실전 보정 2개 때문이다. 순수한 `n_swa`는 "n_seq=1이고 만료가 즉시 일어나는 이상 세계"의 하한이다.
+
+**보정 1 - `x n_seq`: 창은 시퀀스마다 하나씩이다.** SWA 캐시도 base 캐시처럼 **모든 시퀀스가 공유하는 하나의 셀 풀**(unified)이다. 그런데 "최근 n_swa 토큰"이라는 창은 시퀀스별로 독립이다 - 대화 A의 창과 대화 B의 창은 서로 다른 토큰들이라 셀을 겹쳐 쓸 수 없다. 따라서 최악의 경우 동시에 살아 있어야 하는 셀은 `n_swa x n_seq_max`개다. 코드의 `(unified ? n_seq_max : 1)`이 이것이다 - 비통합 모드(스트림별 독립 버퍼)라면 스트림 하나당 창 하나만 담으면 되므로 x1이 된다.
+
+**보정 2 - `+ n_ubatch`: 낡은 셀이 회수되기 전에 새 토큰이 먼저 들어온다.** 4장에서 보듯 SWA 만료는 lazy다 - 창을 벗어난 셀을 즉시 지우는 청소 패스가 없고, 다음 `find_slot`이 배정 시점에 `is_masked_swa`(src/llama-kv-cache.cpp:983)로 "이미 창 밖이니 빈 칸 취급" 판정을 내린다. 문제는 한 스텝 안의 타이밍이다. n_ubatch=512짜리 청크가 들어오는 순간:
+
+- 직전 창의 셀들(최대 n_swa x n_seq개)은 아직 살아 있는 것으로 판정되고,
+- 새로 들어오는 512개 토큰의 K/V도 **지금 당장** 앉을 자리가 필요하며,
+- 이 512개가 밀어낼 낡은 셀들은 배치가 적용되어 pos가 전진한 **뒤에야** 창 밖 판정을 받는다.
+
+즉 "직전 창 + 이번 배치"가 일시 공존하는 순간이 매 스텝 존재하고, `+ n_ubatch`는 그 과도기의 여유분이다. 이게 없으면 논리적으로는 자리가 충분한데도 `find_slot`이 실패할 수 있다.
+
+나머지 두 겹은: `min(size_base, ...)` - n_ctx 자체가 작으면 창 계산값이 base보다 커질 수 있는데 SWA 캐시가 base보다 클 이유는 없으므로 상한; `GGML_PAD(..., 256)` - 성능상 256 배수 올림(코드 주석의 issue #17037).
+
+한 줄 정의: `n_swa x n_seq + n_ubatch`는 "**시퀀스별 창들을 전부 유지하면서(n_swa x n_seq), 만료 판정이 지연되는 한 스텝 동안 이번 배치가 임시로 얹힐 자리(+n_ubatch)까지 확보한, 공유 셀 풀의 최악 동시 점유량**"이다.
+
 모든 seq 연산은 두 캐시에 **팬아웃**된다 (`seq_rm/cp/keep/add/div` 모두 base와 swa에 순차 적용, iswa.cpp:80~107). `seq_pos_min/max`는 SWA 캐시 기준으로 답한다 - base가 SWA의 상위집합(superset)이므로 더 제한적인 쪽이 정답이다 (110~116 주석).
 
 `--swa-full` 옵션(iswa.cpp:53~58)은 SWA 캐시도 풀사이즈로 만든다 - 5장의 rollback 제약을 없애는 대신 메모리 절감을 포기하는 트레이드오프다.
