@@ -17,7 +17,73 @@ PlantUML 원본:
 
 llama.cpp는 이를 **`llama_memory_i` 구현체 교체**로 흡수한다 - context/모델 그래프 빌더의 코드는 그대로이고, `model.create_memory()`가 아키텍처에 맞는 구현을 고른다 (12번 문서의 팩토리 패턴).
 
-## 2. iSWA: llama_kv_cache 두 개의 조합
+## 2. 배경: 왜 full-attention과 SWA 레이어를 섞어 쓰는가
+
+구현으로 들어가기 전에, "혼합(interleaved)"이라는 설계 자체를 표준 모델과 비교해 이해해 둔다.
+
+### 표준 모델: 모든 레이어가 전체를 본다
+
+표준 transformer(Llama 3 등)는 모든 레이어의 모든 토큰이 자기 이전의 **전체** 토큰을 attend한다:
+
+```
+표준 (full attention, 모든 레이어):
+pos:      0  1  2  ...                            99999
+토큰 100000이 보는 범위:  [0 ................. 99999]   <- 전부, 매 레이어마다
+```
+
+이 "전부 본다"의 대가가 1장의 비용 공식이다: KV와 attention 연산 모두 문맥 길이에 선형.
+
+### SWA: 최근 것만 본다
+
+```
+SWA (n_swa = 4096):
+토큰 100000이 보는 범위:        [95904 ....... 99999]   <- 최근 4096개만
+```
+
+창 밖 토큰의 K/V는 **그 레이어에서는** 다시 쓰일 일이 없으므로 버려도 된다 - 4장의 링 버퍼(lazy 만료)가 성립하는 근거이고, 그 레이어의 KV 비용은 문맥 길이와 무관한 상수가 된다.
+
+### 왜 "섞는가": 순수 SWA의 한계와 수용 영역의 누적
+
+**순수 SWA(전 레이어 창)의 한계**: 창 밖 정보에 직접 접근할 수 없어 "10만 토큰 앞에 심어둔 비밀번호를 말해줘" 같은 **장거리 정확 회수(retrieval)**가 무너진다. (초기 Mistral 7B가 전 레이어 SWA였고, 이 한계가 확인되며 순수 SWA는 퇴조했다.)
+
+그래도 SWA 레이어가 쓸모 있는 이유는 **수용 영역(receptive field)이 층마다 누적**되기 때문이다:
+
+```
+레이어 1: 토큰 X는 [X-4096, X]를 직접 봄
+레이어 2: "레이어 1이 [X-8192..X-4096]를 이미 요약해 둔 토큰들"을 봄
+  -> 간접적으로 [X-8192, X]에 접근
+레이어 k: 유효 수용 영역 ~= k x n_swa     (CNN의 수용 영역 누적과 같은 원리)
+```
+
+32층 x 4096창이면 이론상 13만 토큰까지 정보가 간접 전파된다. 다만 "요약의 요약"이라 흐릿해서 정밀한 장거리 조회에는 부족하다.
+
+**그래서 혼합**: 대다수 레이어는 SWA로 두고, 몇 층에 하나씩 full 레이어를 끼워 전체 문맥으로의 "직통 회선"을 복원한다:
+
+```
+Gemma 3 (5:1):   [SWA SWA SWA SWA SWA FULL] [SWA SWA SWA SWA SWA FULL] ...
+Gemma 2 (1:1):   [SWA FULL] [SWA FULL] ...
+```
+
+이 설계를 정당화하는 경험적 사실: **attention 질량의 대부분은 원래 지역적**이다 (문법, 지시어, 구문 관계는 근처 토큰으로 결정). 대다수 레이어를 창으로 잘라도 품질 손실이 미미하고, 소수의 full 레이어가 장거리 회수라는 특수 임무를 전담한다.
+
+비유: 100명이 참여하는 하루짜리 회의 기록 - 표준 모델은 서기 32명 전원이 아침부터의 발언 전체를 계속 뒤적이는 방식이고, SWA 혼합은 서기 27명이 "최근 10분"만 들으며 흐름을 따라가고 5명만 전체 회의록 열람 권한을 갖는 방식이다. "오전에 뭐라고 했었죠?"는 그 5명이 답한다.
+
+### 비교표
+
+| | 표준 (전층 full) | 순수 SWA (전층 창) | **혼합 (interleaved)** |
+|---|---|---|---|
+| 토큰의 직접 시야 | 전체, 매 레이어 | 최근 n_swa, 매 레이어 | 레이어에 따라 다름 |
+| 장거리 정확 회수 | 최상 | **불가** (수용 영역 전파는 흐릿) | full 레이어 전담 -> 거의 유지 |
+| KV 비용 (n_ctx=128K) | 전 레이어 선형 -> 수십 GB | 전 레이어 상수 | full층만 선형: 5:1이면 **~1/6 + 소량 상수** |
+| 대표 모델 | Llama 3, Qwen | (초기 Mistral) | Gemma 2/3, GPT-OSS, Ministral |
+
+### llama.cpp와의 연결
+
+- 어느 레이어가 SWA인지는 **모델 설계자가 정하고 GGUF 메타데이터로 전달**된다 - `llama.attention.sliding_window`(창 크기)와 레이어 패턴이 hparams의 `is_swa(il)`로 조회될 뿐, llama.cpp가 결정하지 않는다 (14번 문서의 "hparams = GGUF 메타데이터" 원칙).
+- 이 "레이어 이질성"이 다음 장 iSWA 2-캐시 구조의 존재 이유다: full층 셀은 오래 살고 SWA층 셀은 링 버퍼로 돌기 때문에, **수명 정책이 다른 두 집단을 한 캐시에 섞을 수 없어** `is_swa(il)` 필터로 두 표준 캐시에 나눠 담는다.
+- 창 판정의 세부 변형(`swa_type`: 창 경계를 자르는 방식)도 hparams로 전달되어 mask 생성과 셀 재사용 판정(`is_masked_swa`)에 동일하게 적용된다.
+
+## 3. iSWA: llama_kv_cache 두 개의 조합
 
 SWA 모델은 보통 SWA 레이어와 full-attention 레이어를 섞어 쓴다(interleaved). `llama_kv_cache_iswa`는 새 캐시 구현이 아니라 **표준 `llama_kv_cache` 인스턴스 2개를 레이어 필터로 묶은 합성물**이다 (src/llama-kv-cache-iswa.h:11~12 주석, 78~79):
 
@@ -43,9 +109,9 @@ uint32_t size_swa = GGML_PAD(std::min(size_base,
 
 모든 seq 연산은 두 캐시에 **팬아웃**된다 (`seq_rm/cp/keep/add/div` 모두 base와 swa에 순차 적용, iswa.cpp:80~107). `seq_pos_min/max`는 SWA 캐시 기준으로 답한다 - base가 SWA의 상위집합(superset)이므로 더 제한적인 쪽이 정답이다 (110~116 주석).
 
-`--swa-full` 옵션(iswa.cpp:53~58)은 SWA 캐시도 풀사이즈로 만든다 - 4장의 rollback 제약을 없애는 대신 메모리 절감을 포기하는 트레이드오프다.
+`--swa-full` 옵션(iswa.cpp:53~58)은 SWA 캐시도 풀사이즈로 만든다 - 5장의 rollback 제약을 없애는 대신 메모리 절감을 포기하는 트레이드오프다.
 
-## 3. SWA 셀의 생애: 별도 프루닝 패스는 없다 (lazy 만료)
+## 4. SWA 셀의 생애: 별도 프루닝 패스는 없다 (lazy 만료)
 
 "창 밖으로 벗어난 셀을 누가 언제 지우는가?"에 대한 답이 우아하다: **아무도 지우지 않는다. find_slot이 "만료된 셀"을 빈 칸처럼 재사용할 뿐이다** (src/llama-kv-cache.cpp:979~986):
 
@@ -66,7 +132,7 @@ if (!can_use && cells.seq_count(idx) == 1) {
 
 덮어쓸 때는 불변식 하나가 지켜진다 (src/llama-kv-cache.cpp:1068~1085): **"각 seq의 [pos_min, pos_max] 사이 모든 pos는 캐시에 존재해야 한다"**. 셀 하나를 덮어쓰면 그보다 낮은 pos의 셀들을 함께 `seq_rm`으로 정리해서(purge), "중간에 구멍 난 창"이 생기지 않게 한다. mask 생성기(set_input_kq_mask)도 같은 `is_masked_swa` 판정을 쓰므로(1569행) 장부와 mask의 기준이 항상 일치한다.
 
-## 4. 운영상 결과: rollback 제약과 체크포인트
+## 5. 운영상 결과: rollback 제약과 체크포인트
 
 SWA 캐시에는 창 밖의 과거가 **물리적으로 없다**(덮어써짐). 그 결과:
 
@@ -75,7 +141,7 @@ SWA 캐시에는 창 밖의 과거가 **물리적으로 없다**(덮어써짐). 
 
 정리하면 SWA는 "메모리 절감 <-> 시간 여행의 자유"를 교환하며, 그 균형점을 사용자가 고른다: 기본(창 크기 캐시 + 체크포인트) vs `--swa-full`(풀 캐시, 제약 없음).
 
-## 5. Hybrid: attention 캐시 + recurrent 상태의 합성
+## 6. Hybrid: attention 캐시 + recurrent 상태의 합성
 
 Mamba/RWKV류 레이어를 섞은 모델은 `llama_memory_hybrid`를 쓴다 - iSWA와 같은 합성 패턴이지만 이번엔 **이종(異種) 메모리의 조합**이다 (src/llama-memory-hybrid.h:16~17 주석):
 
@@ -111,7 +177,7 @@ std::vector<ggml_tensor *> s_l;   // 레이어별 ssm 상태
 
 ubatch 분할도 다르다 (13번 문서 1장의 분할 표): recurrent 상태는 "시퀀스당 하나"라서 한 ubatch 안에 같은 seq의 토큰들이 **연속으로 묶여** 있어야 한다 -> `split_equal`/`split_seq`가 강제되고 `split_simple`은 못 쓴다 (src/llama-memory-hybrid.cpp:77~86).
 
-## 6. 세 구현의 기능 매트릭스
+## 7. 세 구현의 기능 매트릭스
 
 | 기능 | unified `llama_kv_cache` | `iswa` (SWA) | `hybrid` (recurrent 포함) |
 |---|---|---|---|
@@ -122,7 +188,7 @@ ubatch 분할도 다르다 (13번 문서 1장의 분할 표): recurrent 상태�
 | ubatch 분할 | split_simple | split_simple(unified) | **split_equal/seq 강제** |
 | 메모리 비용 | n_ctx 선형 | full층 선형 + SWA층 상수 | attn층 선형 + recr층 **상수** |
 
-## 7. dNPU 함의
+## 8. dNPU 함의
 
 - **합성 패턴이 곧 로드맵이다**: iSWA/hybrid는 새 계약이 아니라 표준 `llama_kv_cache` N개(+recurrent)의 조합이므로, 14번 문서의 host-visible KV 계약(장부/idxs/mask)을 지키면 **iSWA는 자동으로 얻어진다** - firmware 입장에서는 "레이어별로 참조하는 KV 영역과 n_kv가 다를 뿐"이다 (`register_kv_region`이 레이어별 디스크립터인 이유가 여기서도 유효).
 - SWA 캐시의 lazy 만료는 firmware에 아무 요구도 하지 않는다 - 재사용 판정은 host의 find_slot이 하고, firmware는 여전히 idxs/mask만 소비한다.
