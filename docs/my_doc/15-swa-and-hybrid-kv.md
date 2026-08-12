@@ -112,13 +112,25 @@ x = tok_embd[ id("Paris") ]          x ∈ R^4096
 
 attention이 "남의 정보를 가져오는" 유일한 단계라면, FFN은 **토큰 혼자서** 자기 벡터를 비선형 변환하는 단계다 (상세 주석판의 `[11008, 1]` 왕복).
 
-**32층 통과 후: logits**
+**32층 통과 후: lm_head -> logits**
 
 ```
   x_final = RMSNorm(x)                     (32층의 덧붙임이 누적된 메모장)
-  logits  = W_out · x_final                R^32000 <- R^4096  (lm_head)
+
+  logits  = W_lm_head · x_final            R^32000 <- R^4096
+            ^^^^^^^^^
+            lm_head (language model head) = 최종 hidden state를
+            어휘 분포로 투영하는 행렬. llama.cpp의 model.output 텐서
+
   P(다음 토큰) = softmax(logits) -> 샘플링 -> "is"
 ```
+
+lm_head에 대해 알아둘 것:
+
+- **크기**: `[n_embd, n_vocab]` = 4096 x 32000 ~= 1.3억 파라미터 (F16 ~262MB) - 단일 행렬로는 모델 최대급. 소형 모델은 `tok_embd`와 가중치를 공유(weight tying)하기도 한다 - 0단계의 어휘표를 방향만 바꿔 재사용하는 셈.
+- **레이어의 attention/FFN과 달리 딱 1회만** 실행된다 - 32층의 반복 구조 밖에 있는 "출구"다.
+- **출력 토큰에만 계산한다**: prefill에서 13토큰이 들어와도 `logits=1`인 토큰(inp_out_ids)만 lm_head를 통과한다 (13번 문서 prefill 주석판의 "get_rows에서 13 -> 2 축소" 후 lm_head가 실행되는 이유). 중간 토큰의 logits는 아예 만들지 않는다.
+- logits의 i번째 값 = "다음 토큰이 어휘 i일 점수"이고, 여기에 softmax/샘플링(온도, top-k 등)을 적용하는 것은 host의 샘플러 몫이다.
 
 **전체 조감도**
 
@@ -133,7 +145,7 @@ attention이 "남의 정보를 가져오는" 유일한 단계라면, FFN은 **�
               │  ...        │        (레이어마다 자기 KV - x n_layer의 정체)
               └─ 레이어 32 ─┤  x³²
                             │
-                     RMSNorm + W_out
+                     RMSNorm + lm_head(W_lm_head, 4096x32000, 1회만)
                             │
                      logits ∈ R³²⁰⁰⁰ ──softmax/샘플링──> "is"
 ```
@@ -142,7 +154,7 @@ attention이 "남의 정보를 가져오는" 유일한 단계라면, FFN은 **�
 
 | 수식 | ggml op |
 |---|---|
-| `W_q·h` 등 투영, `W_out` | `mul_mat` (가중치 leaf x 활성값) |
+| `W_q·h` 등 투영, lm_head(`W_lm_head`) | `mul_mat` (가중치 leaf x 활성값) |
 | RoPE | `rope` (K-shift 그래프도 같은 op) |
 | KV append | `set_rows` (14번 문서의 "그래프 안의 KV update") |
 | `q·Kᵀ/√d + mask -> softmax -> ·V` | `mul_mat` + `soft_max(mask)` + `mul_mat`, FA면 `flash_attn_ext` 1개로 융합 |
