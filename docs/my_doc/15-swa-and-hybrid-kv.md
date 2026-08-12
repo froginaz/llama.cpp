@@ -53,6 +53,104 @@ llama.cpp는 이를 **`llama_memory_i` 구현체 교체**로 흡수한다 - cont
 
 비유: 원고 하나가 편집자 32명을 차례로 통과하는 교정팀이다. 모두 같은 빨간펜을 들었지만 앞자리는 자연히 맞춤법(주변 몇 단어면 되는 일), 뒷자리는 논지 일관성을 맡게 된다. 표준 모델은 32명 전원에게 원고 **전체 열람권**을 주는 것 - 맞춤법 담당자는 쓰지도 않는 권한의 비용(KV)을 다 낸다. SWA 혼합은 27명에게 "직전 몇 페이지만" 주고 복선 담당 5명에게만 전체 열람권을 주며, 5명이 찾아온 정보는 회람 메모(residual stream)로 뒷사람들에게 전달된다.
 
+### 수식으로 보는 레이어: 입력 토큰 -> attention -> FFN -> logits
+
+위 "수집 + 가공"을 수식과 shape으로 정확히 따라가 본다. 단일 토큰 decode(14번 문서 예제의 "Paris", pos 7) 기준이며, 13번 문서 상세 주석판의 텐서 흐름(`[4096,1] -> [32000,1]`)의 수학적 실체다.
+
+**0단계. 입력 토큰 -> 벡터**
+
+```
+x = tok_embd[ id("Paris") ]          x ∈ R^4096
+```
+
+`get_rows` 한 번 - 어휘표(32000 x 4096)에서 행 하나를 꺼낸다. 이 `x`가 residual stream(공용 메모장)의 시작값이고, 이후 32개 레이어가 여기에 계속 덧붙인다.
+
+**레이어 l의 전반부: attention = "수집"**
+
+```
+                    ┌─────────────────── residual stream x ────────────────────┐
+                    │                                                          │
+  h = RMSNorm(x)    │   (1) 정규화                                             │
+                    │                                                          ▼
+  q = W_q·h         │   (2) 투영: q ∈ R^4096 (32헤드 x 128)               x + attn_out
+  k = W_k·h         │            k ∈ R^1024 (8헤드 x 128)  <- GQA 축소        │
+  v = W_v·h         │            v ∈ R^1024                                    │
+                    │                                                          │
+  q,k <- RoPE(q,k,pos=7)  (3) 위치 회전 (K에 구워짐 -> K-shift가 필요한 이유) │
+                    │                                                          │
+  K_cache[l][cell 7] = k    (4) KV append (set_rows 노드 - 14번 문서의 그 지점)│
+  V_cache[l][cell 7] = v                                                       │
+```
+
+**(5) attention 본체** - 헤드 i(32개, GQA로 4개가 KV헤드 1개를 공유)마다:
+
+```
+                 qᵢ · K_cache[l][j]ᵀ
+  score(j)  =  ─────────────────────  +  mask[j]        j = 0 .. n_kv-1
+                      √d_head(=128)                      ↑
+                                                    KQ_mask가 수식에
+  α = softmax(score)          <- α ∈ R^n_kv          들어오는 정확한 자리:
+                                                    보이는 셀 = +0
+  oᵢ = Σⱼ αⱼ · V_cache[l][j]  <- oᵢ ∈ R^128          가려진 셀 = -inf -> α=0
+```
+
+여기서 이 문서 시리즈의 모든 논의가 수식 한 줄에 모인다: **mask[j]가 -inf면 softmax 후 가중치가 정확히 0** - seq 격리도, causal도, SWA 창도, 패딩 차단도 전부 이 덧셈 항 하나로 구현된다. **SWA 레이어란 "mask가 j ∈ [pos-n_swa, pos] 밖을 전부 -inf로 채우는 레이어"일 뿐이다.**
+
+```
+  attn_out = W_o · [o₁; o₂; ...; o₃₂]     (4096 <- 32 x 128 연결)
+  x = x + attn_out                        (6) residual 덧셈: 메모장에 덧붙임
+```
+
+**레이어 l의 후반부: FFN = "가공"**
+
+```
+  h = RMSNorm(x)
+  ffn_out = W_down · ( silu(W_gate·h) ⊙ W_up·h )      (SwiGLU)
+             4096  <-        11008    ⊙  11008  <- 4096
+  x = x + ffn_out                          residual 덧셈
+```
+
+attention이 "남의 정보를 가져오는" 유일한 단계라면, FFN은 **토큰 혼자서** 자기 벡터를 비선형 변환하는 단계다 (상세 주석판의 `[11008, 1]` 왕복).
+
+**32층 통과 후: logits**
+
+```
+  x_final = RMSNorm(x)                     (32층의 덧붙임이 누적된 메모장)
+  logits  = W_out · x_final                R^32000 <- R^4096  (lm_head)
+  P(다음 토큰) = softmax(logits) -> 샘플링 -> "is"
+```
+
+**전체 조감도**
+
+```
+ "Paris"(id) ──get_rows──> x⁰ ∈ R⁴⁰⁹⁶
+                            │
+              ┌─ 레이어 1 ──┤  x¹ = x⁰ + Attn₁(x⁰) + FFN₁(...)
+              │  ...        │        ▲          ▲
+              │             │        │          └ 혼자 가공
+              │             │        └ K/V_cache[1] 참조·기록 + mask
+              ├─ 레이어 l ──┤  xˡ = xˡ⁻¹ + Attnₗ(xˡ⁻¹) + FFNₗ(...)
+              │  ...        │        (레이어마다 자기 KV - x n_layer의 정체)
+              └─ 레이어 32 ─┤  x³²
+                            │
+                     RMSNorm + W_out
+                            │
+                     logits ∈ R³²⁰⁰⁰ ──softmax/샘플링──> "is"
+```
+
+**ggml 구현과의 1:1 대응** (상세 주석판의 노드들이 위 수식의 어느 항인가):
+
+| 수식 | ggml op |
+|---|---|
+| `W_q·h` 등 투영, `W_out` | `mul_mat` (가중치 leaf x 활성값) |
+| RoPE | `rope` (K-shift 그래프도 같은 op) |
+| KV append | `set_rows` (14번 문서의 "그래프 안의 KV update") |
+| `q·Kᵀ/√d + mask -> softmax -> ·V` | `mul_mat` + `soft_max(mask)` + `mul_mat`, FA면 `flash_attn_ext` 1개로 융합 |
+| residual 덧셈 | `add` |
+| SwiGLU | `mul_mat` x3 + `silu` + `mul` |
+
+이 수식 수준에서 "레이어를 섞는다"의 의미가 최종적으로 명확해진다: **레이어 간 차이는 오직 (5)의 mask[j]가 허용하는 j의 범위뿐**이고(전체 vs 최근 n_swa), 나머지 수식은 전 레이어 동일하다. 그 mask 범위 차이가 K/V_cache[l]의 필요 크기 차이(n_ctx 선형 vs 상수)로, 곧 3장의 2-캐시 구조로 이어진다.
+
 ### 표준 모델: 모든 레이어가 전체를 본다
 
 표준 transformer(Llama 3 등)는 모든 레이어의 모든 토큰이 자기 이전의 **전체** 토큰을 attend한다:
