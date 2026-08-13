@@ -527,25 +527,27 @@ K-shift가 디바이스 작업이 필요한 유일한 "연산성" 조작인 이�
 
 ### 조작 <-> 실행 옵션 매핑: 각 조작을 발동시키는 도구들
 
-위 표의 조작들이 실제로 어느 실행 파일의 어느 옵션으로 발동되는지의 대응표다 (옵션 정의는 common/arg.cpp에서 확인). 마지막 열은 8장의 **dNPU 요구사항 등급** - A(장부만, firmware 작업 0) / B(K-shift 커널) / C(device blit) / D(get/set_tensor DMA) / E(dequant).
+위 표의 조작들이 실제로 어느 실행 파일의 어느 옵션으로 발동되는지의 대응표다 (옵션 정의는 common/arg.cpp에서 확인). **API 열**은 응용이 호출하는 include/llama.h 공개 함수 - 옵션은 결국 이 API 호출로 번역된다(장부 조작은 `llama_memory_*`, 상태 덤프는 `llama_state_*`). 마지막 열은 8장의 **dNPU 요구사항 등급** - A(장부만, firmware 작업 0) / B(K-shift 커널) / C(device blit) / D(get/set_tensor DMA) / E(dequant).
 
-| 조작 | Executable + 옵션 | 내부에서 일어나는 일 | dNPU 등급 |
-|---|---|---|---|
-| **reuse** | **llama-server** - 자동 prefix 매칭 + `-sps, --slot-prompt-similarity S`(슬롯 배정 유사도 기준, arg.cpp:3246) + `--cache-idle-slots` | 슬롯의 토큰 리스트와 비교해 공통 prefix 셀 유지, suffix만 decode | **A** |
-| reuse 확장 (중간 청크) | **llama-server** `--cache-reuse N` (arg.cpp:3059 - 설명문이 "reusing ... **via KV shifting**") | 청크를 seq_add로 밀어서 재사용 -> shift와 결합된 재사용 | **B** (shift 의존) |
-| **sharing** (`seq_cp`, unified) | **llama-parallel** `-pps` | 시스템 프롬프트를 seq 0에 1회 prefill 후 `llama_memory_seq_cp(mem, 0, i, -1, -1)`로 전 클라이언트 공유 (examples/parallel/parallel.cpp:280, 309, 469) | **A** |
-| sharing 유사 효과 | **llama-batched** `--kv-unified` | seq_cp가 아니라 prefill 시 모든 seq 동시 태깅 (13번 문서 4장) | **A** |
-| sharing (비통합 stream copy) | 직접 옵션 없음 - `-kvu` 없이 운용 중 seq_cp 발생 시 내부 자동 | `ggml_backend_tensor_copy` (device-to-device) | **C** |
-| **rewind** (rollback) | **llama-server / llama-speculative** `-md, --model-draft` + `--draft-max/--draft-min` (arg.cpp:3640, 3785) | 거부된 draft 토큰을 seq_rm으로 제거 - 아래 E1 시나리오 | **A** |
-| | llama-server 자동 동작 | 슬롯 프롬프트가 중간부터 달라지면 분기점 이후 seq_rm | **A** |
-| **remove/clear/keep** | **llama-server** HTTP `POST /slots/{id}?action=erase`; 새 요청의 슬롯 점유 시 자동 | 장부만 정리 | **A** |
-| | **llama-cli** `--keep N` (arg.cpp:1312) | context shift 때 앞 N토큰 보존 - "중간 seq_rm + 나머지 shift" 조합 | **B** (shift 의존) |
-| **shift** (context shift) | **llama-cli/server** `--context-shift` / `--no-context-shift` (arg.cpp:1369) | 장부 pos 갱신 + K-shift 그래프 실행 | **B** |
-| shift 파생 (self-extend, `seq_div`) | **llama-passkey/cli** `-gan, --grp-attn-n` + `-gaw` (arg.cpp:2015) | pos 나눗셈 - 역시 K-shift 계열 | **B** |
-| **save/restore** (context 전체) | **llama-cli** `--prompt-cache FNAME` / `--prompt-cache-all` / `--prompt-cache-ro` (arg.cpp:1496~1510) | `llama_state_save_file` | **D** |
-| save/restore (seq 단위) | **llama-server** `--slot-save-path PATH` + HTTP `POST /slots/{id}?action=save\|restore` (arg.cpp:3091) | `llama_state_seq_save_file` - 유일한 MB급 DMA | **D** |
-| save/restore (체크포인트) | **llama-server** `-ctxcp, --ctx-checkpoints N` | SWA/recurrent용 - 내부적으로 state_seq(+SWA_ONLY) 사용 | **D** |
-| save/restore (검증 도구) | **llama-save-load-state** (예제 exe) | save -> restore -> 재decode 일치 검증 - **dNPU M4.3 검증에 그대로 사용 가능** | **D** |
+| 조작 | Executable + 옵션 | API (llama.h) | 내부에서 일어나는 일 | dNPU 등급 |
+|---|---|---|---|---|
+| **reuse** | **llama-server** - 자동 prefix 매칭 + `-sps, --slot-prompt-similarity S`(슬롯 배정 유사도 기준, arg.cpp:3246) + `--cache-idle-slots` | `llama_memory_seq_rm` (분기점 이후만 제거) | 슬롯의 토큰 리스트와 비교해 공통 prefix 셀 유지, suffix만 decode | **A** |
+| reuse 확장 (중간 청크) | **llama-server** `--cache-reuse N` (arg.cpp:3059 - 설명문이 "reusing ... **via KV shifting**") | `llama_memory_seq_rm` + `llama_memory_seq_add` | 청크를 seq_add로 밀어서 재사용 -> shift와 결합된 재사용 | **B** (shift 의존) |
+| **sharing** (`seq_cp`, unified) | **llama-parallel** `-pps` | `llama_memory_seq_cp` | 시스템 프롬프트를 seq 0에 1회 prefill 후 `llama_memory_seq_cp(mem, 0, i, -1, -1)`로 전 클라이언트 공유 (examples/parallel/parallel.cpp:280, 309, 469) | **A** |
+| sharing 유사 효과 | **llama-batched** `--kv-unified` | API 불필요 - `llama_batch`의 seq_id 다중 태깅 + `llama_decode` | seq_cp가 아니라 prefill 시 모든 seq 동시 태깅 (13번 문서 4장) | **A** |
+| sharing (비통합 stream copy) | 직접 옵션 없음 - `-kvu` 없이 운용 중 seq_cp 발생 시 내부 자동 | `llama_memory_seq_cp` (내부에서 blit로 번역) | `ggml_backend_tensor_copy` (device-to-device) | **C** |
+| **rewind** (rollback) | **llama-server / llama-speculative** `-md, --model-draft` + `--draft-max/--draft-min` (arg.cpp:3640, 3785) | `llama_memory_seq_rm(mem, s, n_keep, -1)` | 거부된 draft 토큰을 seq_rm으로 제거 - 아래 E1 시나리오 | **A** |
+| | llama-server 자동 동작 | `llama_memory_seq_rm` | 슬롯 프롬프트가 중간부터 달라지면 분기점 이후 seq_rm | **A** |
+| **remove/clear/keep** | **llama-server** HTTP `POST /slots/{id}?action=erase`; 새 요청의 슬롯 점유 시 자동 | `llama_memory_seq_rm(mem, s, -1, -1)`, 전체는 `llama_memory_clear` | 장부만 정리 | **A** |
+| | **llama-cli** `--keep N` (arg.cpp:1312) | `llama_memory_seq_rm`(중간 구간) + `llama_memory_seq_add`(나머지) | context shift 때 앞 N토큰 보존 - "중간 seq_rm + 나머지 shift" 조합 | **B** (shift 의존) |
+| **shift** (context shift) | **llama-cli/server** `--context-shift` / `--no-context-shift` (arg.cpp:1369) | `llama_memory_seq_add(mem, s, p0, p1, delta)` | 장부 pos 갱신 + K-shift 그래프 실행 | **B** |
+| shift 파생 (self-extend, `seq_div`) | **llama-passkey/cli** `-gan, --grp-attn-n` + `-gaw` (arg.cpp:2015) | `llama_memory_seq_div` (+ `seq_add`) | pos 나눗셈 - 역시 K-shift 계열 | **B** |
+| **save/restore** (context 전체) | **llama-cli** `--prompt-cache FNAME` / `--prompt-cache-all` / `--prompt-cache-ro` (arg.cpp:1496~1510) | `llama_state_save_file` / `llama_state_load_file` | `llama_state_save_file` | **D** |
+| save/restore (seq 단위) | **llama-server** `--slot-save-path PATH` + HTTP `POST /slots/{id}?action=save\|restore` (arg.cpp:3091) | `llama_state_seq_save_file` / `llama_state_seq_load_file` | `llama_state_seq_save_file` - 유일한 MB급 DMA | **D** |
+| save/restore (체크포인트) | **llama-server** `-ctxcp, --ctx-checkpoints N` | `llama_state_seq_get_data_ext` / `set_data_ext` + `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY` (파일이 아닌 메모리 버퍼로) | SWA/recurrent용 부분 스냅샷 (15번 문서 5장) | **D** |
+| save/restore (검증 도구) | **llama-save-load-state** (예제 exe) | `llama_state_get_data` / `llama_state_set_data` (+ seq 변형) | save -> restore -> 재decode 일치 검증 - **dNPU M4.3 검증에 그대로 사용 가능** | **D** |
+
+API 열에서 읽히는 규칙성: **A/B/C 행은 전부 `llama_memory_*`**(장부 조작 - 데이터는 그대로, B/C만 파생 장치 작업 수반)이고, **D 행은 전부 `llama_state_*`**(상태 덤프 - 데이터 자체를 꺼내고 넣음)다. 즉 API 접두사가 곧 "장부 계열 vs DMA 계열"의 경계선이다. `llama_state_*`의 파일 계열(`*_save_file/load_file`)과 버퍼 계열(`*_get_data/set_data`)은 목적지만 다르고(디스크 vs 메모리) 내부 경로는 동일하다.
 
 등급별로 다시 읽으면 단계적 검증 경로가 된다: **A 행들은 visible KV 계약(idxs/mask)만으로 즉시 켜지고**, B 행들은 firmware의 K-shift 커맨드 1개가 추가된 뒤에, C/D 행들은 buft의 `cpy_tensor`/`get·set_tensor` 구현 뒤에 순서대로 열린다.
 
