@@ -666,6 +666,37 @@ E F의 K/V 재계산을 아끼는 대신 K-shift가 필요하다 - 그래서 reu
 
 **sharing 비통합 (C) / save-restore (D)** - 이 둘은 데이터 이동 자체가 목적이다: C는 스트림 버퍼 간 같은 오프셋으로의 device 내 blit(`ggml_backend_tensor_copy`), D는 device -> host 덤프(15번 문서 5장의 체크포인트 저장 경로가 상세 예제다). 장부 조작으로는 대체 불가능한 이유: C는 물리적으로 분리된 버퍼라 태그 공유가 불가능하고, D는 프로세스 밖(디스크/다른 프로세스)으로 나가야 하기 때문이다.
 
+### 번외 매핑: API 레벨 런타임(OpenClaw)에서의 대응물
+
+같은 조작들이 **KV에 접근할 수 없는 층**에서는 어떤 모습이 되는지의 대조표다. OpenClaw는 LLM을 API(Anthropic 등)로 호출하는 에이전트 게이트웨이다 - inference 엔진이 아니므로 KV 셀도 장부도 만질 수 없고, 조작 대상은 **transcript(대화 토큰 열, JSONL로 영속화)**다. 그런데 구조를 포개 보면 정확히 한 층 위의 동형(isomorphism)이 나타난다:
+
+```
+llama.cpp:  장부(셀 메타데이터)  ->  KV 캐시(물리 데이터, device)
+OpenClaw:   transcript(토큰 열)  ->  provider의 prefix cache(물리 KV, API 제공자 서버)
+```
+
+즉 OpenClaw 계층에서는 **transcript가 장부의 역할**을 하고, 물리적 KV 재사용은 전적으로 provider의 prompt caching에 위임된다. 모든 조작이 "토큰 열 편집 후 재전송"으로 표현되는데, 이것이 가능한 근거가 바로 15번 문서 5장의 원리 - **KV는 memoization이므로 재계산(재전송) 폴백이 항상 존재한다** - 의 극단적 적용이다: API 레벨 런타임은 *항상* 재계산 경로를 타고, 캐시 히트는 provider 쪽 최적화로만 존재한다.
+
+| KV 조작 (위 표) | llama.cpp 수단 | OpenClaw 대응 기능 | 대응의 성격 |
+|---|---|---|---|
+| **reuse** (prefix 재사용) | 장부 prefix 유지 + suffix만 decode | 세션 지속(transcript에 누적) + provider **prompt caching**이 prefix의 KV 재사용 | 목적 동일, 물리 재사용 주체가 provider로 이동 |
+| **sharing** (`seq_cp`, 시스템 프롬프트 공유) | seq 0에 1회 prefill 후 태그 복사 | 모든 세션이 같은 시스템 프롬프트/워크스페이스 파일을 공유 - 각 세션 요청의 공통 prefix가 provider 캐시에 1회만 적재됨 | 동일 효과를 provider 캐시 키 일치로 달성 |
+| **rewind** (speculative 무르기) | seq_rm으로 거부분 제거 | 직접 대응 없음 (speculative는 provider 내부 소관) | 계층상 소멸 |
+| **remove/clear** | seq_rm / clear | **세션 리셋**(`/new` 류) - transcript 폐기 후 새 세션 | 동일 목적, transcript 단위 |
+| **shift** (context shift) | 오래된 셀 제거 + pos 당김 + K-shift | **compaction** - 창이 차면 과거 대화를 요약으로 치환해 transcript를 줄임 | 목적 동일(창 초과 대응), 수단이 근본적으로 다름: pos 재활용(무손실) vs 요약(손실 압축) |
+| **--keep N** (앞부분 보존) | 앞 N토큰 제외하고 shift | compaction이 시스템 프롬프트·메모리 파일은 보존하고 대화 본문만 요약 | 동일 직관: "정체성은 남기고 중간을 버린다" |
+| shift 파생 (self-extend) | pos 나눗셈으로 학습 창 초과 | 대응 없음 - provider 모델의 창은 고정이므로, 초과분은 결국 compaction(요약)이 흡수 | 계층상 소멸 |
+| **save/restore** (세션) | state_seq 덤프/복원 (MB급 DMA) | **transcript 영속화 + 세션 재개** - 게이트웨이 재시작 후에도 JSONL에서 이어감. 장기 기억은 별도 **메모리 파일**(요약된 지식) | 동일 목적. 단 복원 후 KV는 provider 캐시 상태에 따라 재계산될 수 있음 |
+| checkpoint (-ctxcp) | SWA/recurrent용 부분 스냅샷 | 대응 없음 - compaction 요약 자체가 "손실형 체크포인트" 역할 | 유사 개념의 손실 버전 |
+| (해당 없음) | - | **서브에이전트 분기** - 현재 문맥 일부를 새 세션에 이식해 병렬 작업 | seq_cp의 "느슨한 사촌": 태그 복사가 아니라 내용 재서술 |
+
+이 대조가 주는 교훈 두 가지:
+
+1. **"장부와 데이터의 분리"는 계층마다 반복되는 패턴이다.** 어느 층이든 "가벼운 회계(장부/transcript)를 조작하고, 무거운 데이터(KV/provider 캐시)는 폴백(재계산/재전송)으로 보호한다"는 같은 설계가 나타난다. dNPU 계약(A등급 = 장부만)은 이 일반 패턴의 최하층 인스턴스다.
+2. **무손실 vs 손실의 경계가 층을 가른다.** llama.cpp의 조작은 전부 무손실(토큰 열이 보존됨)이지만, API 레벨의 compaction은 손실(요약)이다 - KV에 접근할 수 없으면 "pos 재활용" 같은 무손실 트릭이 불가능하기 때문이다. 거꾸로 말하면, host-visible KV 계약이 확보하는 것은 바로 이 무손실 조작 능력이다.
+
+(참고: OpenClaw 기능 명칭은 2026년 초 시점의 지식 기반이며 세부 명령 표기는 버전에 따라 다를 수 있다. 이 표의 목적은 명령 레퍼런스가 아니라 계층 간 구조 대응이다.)
+
 ### 장부만 조작하면 mask는 어떻게 맞춰지나 - mask는 저장물이 아니라 파생물이다
 
 위 표에서 등급 A 조작들이 "장부만"으로 끝나는 이유는, **KQ_mask가 수정되는 객체가 아니라 매 스텝 장부에서 새로 계산되는 파생물**이기 때문이다:
