@@ -451,10 +451,114 @@ if (!can_use && cells.seq_count(idx) == 1) {
 
 ## 5. 운영상 결과: rollback 제약과 체크포인트
 
-SWA 캐시에는 창 밖의 과거가 **물리적으로 없다**(덮어써짐). 그 결과:
+SWA 캐시에는 창 밖의 과거가 **물리적으로 없다**(덮어써짐). 그 결과 `seq_rm(seq, p, -1)`으로 무르고 재-decode하는 자유가 제한된다 - 14번 문서 E1(speculative)의 전제가 창 안에서만 성립한다. 이 절은 그 한계가 정확히 어디인지, 넘으면 무슨 일이 일어나는지, 보완책(체크포인트)은 누가 어떻게 만드는지를 코드로 따라간다.
 
-- **자유로운 rollback 불가**: `seq_rm(seq, p, -1)`으로 창 이전 지점까지 무르고 재-decode하는 것이 불가능하다 - 그 구간의 K/V가 이미 사라졌기 때문. 14번 문서 E1(speculative)의 전제가 창 안에서만 성립한다.
-- **서버의 보완책 = 컨텍스트 체크포인트**: llama-server의 `-ctxcp`(`--ctx-checkpoints`, 기본 32개)가 프롬프트 처리 중 주기적으로 SWA 캐시 상태의 스냅샷을 host 메모리에 저장해 둔다 (tools/server/server-context.cpp:1129~, create_checkpoint 2033~). 되돌아갈 일이 생기면(prefix 재사용, speculative 등) 가장 가까운 체크포인트를 복원하고 그 지점부터 재-decode한다. 스냅샷은 `llama_state_seq_*`에 **`LLAMA_STATE_SEQ_FLAGS_SWA_ONLY`** 플래그(include/llama.h:873)를 줘서 SWA 캐시 부분만 덤프한다 - base 캐시는 rollback 가능하므로 저장할 필요가 없다.
+### 안전한 rollback 깊이는 n_swa + n_ubatch가 아니라 약 n_ubatch다
+
+흔한 혼동: size_swa = n_swa + n_ubatch(패딩 전)이니 그만큼 물러날 수 있다고 기대하기 쉽다. 하지만 size_swa는 **총 상주량**이지 rollback 여유가 아니다. 지점 p로 물러나 decode를 재개하려면 p 이후가 아니라 **p 뒤쪽으로 창 하나(n_swa)가 통째로** 상주해 있어야 한다 - SWA 레이어가 p+1 토큰을 계산할 때 (p-n_swa, p] 구간의 K/V를 읽기 때문이다.
+
+single seq, n_swa=1024, n_ubatch=512로 계산하면:
+
+```
+size_swa = PAD(1024x1 + 512, 256) = 1536셀
+상주 구간(연속 접미사):  [head-1535, head]        <- 최선의 경우
+p로 물러나려면 필요:     [p-1023, p] 전부 상주
+-> p-1023 >= head-1535  ->  p >= head-512
+-> 최대 rollback 깊이 ~= 512 = n_ubatch (+패딩 여유)
+```
+
+즉 상주량 중 **n_swa만큼은 "재개 지점 뒤의 창"으로 소모**되고, rollback에 쓸 수 있는 것은 나머지 슬랙(~n_ubatch)뿐이다. 4장의 purge 불변식([pos_min, pos_max] 연속성) 덕에 상주 구간이 항상 연속 접미사이므로 이 계산이 성립한다. speculative(-md)의 n_draft(수십 토큰) 무르기가 이 슬랙 안에 넉넉히 들어온다.
+
+### 실제 판정은 정적 공식이 아니라 동적 pos_min 가드다
+
+lazy 만료 때문에 "지금 몇 셀이 살아 있는가"는 실행 이력에 따라 다르다. 그래서 llama-server는 공식이 아니라 장부에 묻는다 (tools/server/server-context.cpp:2789, 2841):
+
+```cpp
+const auto pos_min_thold = std::max(0, pos_next - n_swa - ...);
+const auto pos_min = llama_memory_seq_pos_min(mem, slot.id);  // SWA 캐시의 최소 상주 pos
+if (pos_min >= pos_min_thold) {
+    // 재개 지점 뒤의 창이 부족 -> 복구 경로로
+```
+
+3장에서 `seq_pos_min`이 iSWA에서 **SWA 캐시 기준**으로 답하는 이유가 바로 이 체크다 - 더 제한적인 쪽이 병목이다.
+
+### 한도를 넘으면: 에러가 아니라 폴백 사다리
+
+`seq_rm` 자체(장부 조작)는 항상 성공한다. 문제는 재개 가능성이고, 서버는 부족을 감지하면 두 단계로 복구한다 (server-context.cpp:2841~2871):
+
+1. **체크포인트 복원**: 저장해 둔 스냅샷 중 `pos_min < thold`인 것(충분히 과거까지 창을 가진 것)을 찾아 복원하고 거기서부터 재-decode.
+2. **전체 재처리**: 쓸 만한 체크포인트가 없으면 `pos_next = 0; n_past = 0` - 로그의 "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory)"가 이 지점이다.
+
+| rollback 깊이 d | 결과 |
+|---|---|
+| d ≲ n_ubatch (슬랙 안) | 캐시에서 바로 재개 - speculative(-md)가 여기 속함 |
+| 그 이상, 체크포인트 있음 | 가장 가까운 스냅샷 복원 후 재-decode |
+| 그 이상, 체크포인트 없음 | 프롬프트 전체 재처리 (pos 0부터) |
+| `--swa-full` | 깊이 무제한 (base와 동일) |
+
+정확성은 항상 보존되고, 대가는 재계산 시간이다.
+
+### 체크포인트의 단위와 저장 경로: 누가 무엇을 어떻게 저장하나
+
+**단위는 "kv_swa 전체"가 아니라 "한 sequence의 SWA(partial) 부분"이다.** 두 축으로 잘린다:
+
+- **sequence 축**: 저장 API가 `llama_state_seq_get_data_ext(ctx, buf, size, seq_id, flags)`다. `llama_kv_cache::state_write`(src/llama-kv-cache.cpp:1922~1923)는 장부를 스캔해 해당 seq가 태그된 셀들만 연속 구간으로 모은다. 캐시 버퍼 통째가 아니다.
+- **캐시 축**: flag로 base를 건너뛴다 (src/llama-kv-cache-iswa.cpp:226~232):
+
+```cpp
+void llama_kv_cache_iswa::state_write(..., llama_state_seq_flags flags) const {
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        kv_base->state_write(io, seq_id, flags);   // 체크포인트에선 스킵
+    }
+    kv_swa->state_write(io, seq_id, flags);        // 항상 저장
+}
+```
+
+표기 주의: 과거 명칭 `LLAMA_STATE_SEQ_FLAGS_SWA_ONLY`는 하위호환 별칭이고 정식 명칭은 **`LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY`**(값 동일, include/llama.h:872~876)다. "partial"로 일반화된 이유: SWA뿐 아니라 **recurrent 캐시(Mamba류)도 rollback 불가한 부분 상태**라 같은 체크포인트가 필요하기 때문이다(6장).
+
+전체 경로:
+
+```
+llama-server (create_checkpoint, server-context.cpp:2033)
+  · 언제: 프롬프트 처리 중 주기적으로 + speculative 직전
+  · 어디에: slot.prompt.checkpoints (host RAM, -ctxcp 개수 상한, 초과 시 가장 오래된 것 삭제)
+    | update_tgt(ctx, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)
+    v
+llama_state_seq_get_data_ext -> llama_context::state_seq_get_data -> memory->state_write(io, seq_id, flags)
+    v
+llama_kv_cache_iswa::state_write (base 스킵, swa만)
+    v
+llama_kv_cache::state_write
+  1. 장부 스캔 -> seq의 셀들을 연속 구간으로 수집
+  2. state_write_meta: 셀별 pos, seq_ids           (llama-kv-cache.cpp:1965~)
+  3. state_write_data: 레이어별 K/V 행 덤프          (1998~)
+     io.write_tensor(k, range.first * k_size_row, buf_size)
+    v
+io.write_tensor 구현 (llama-context.cpp:2514~2517)
+  ggml_backend_tensor_get(tensor, temp_buffer, offset, size)   <- device -> host 이동은 여기서
+```
+
+즉 **주체는 응용(서버), 시점도 응용이 결정, 최종 바닥은 backend의 `get_tensor`**다. 복원은 역방향: `state_read_meta`가 장부에 셀들을 재배치하고, `state_read_data`가 `ggml_backend_tensor_set`으로 K/V 바이트를 되쓴다. 크기 감각: n_swa=1024 창 가득, SWA 레이어 16개, F16이면 셀당 2KB(K+V) x 1024 x 16 ~= 32MB - 14번 문서 6장 트래픽 표의 "save/restore만 MB급" 행이 이것이다.
+
+### workaround의 원리: KV 캐시는 memoization이다
+
+위 폴백 사다리가 보여주는 일반 원리가 있다. KV 캐시의 모든 항목은 결정론적 forward의 중간 산물이므로, **원본 토큰 열만 있으면 언제든 재계산으로 동일한 바이트를 복원할 수 있다**(서버가 `slot.prompt.tokens`를 항상 host에 보관하는 것이 전제). 따라서 14번 문서의 dNPU 등급 관점에서 보면:
+
+- **B/C/D 등급 조작은 전부 "재계산 회피"라는 성능 기능**이다. 없으면 기능이 사라지는 게 아니라 재-prefill 비용이 돌아올 뿐이다. D(체크포인트/세션)의 폴백은 위에서 본 대로 코드에 이미 자동으로 존재하고, B(--context-shift/--keep/--cache-reuse)는 opt-in 옵션이라 안 켜면 서버가 자연스럽게 재처리한다. C(비통합 stream copy)도 대상 스트림 재-prefill로 대체된다.
+- **유일한 진짜 기능 결손은 `-gan`(self-extend)** - "학습 컨텍스트 초과"라는 능력 자체가 목적이라 재계산으로 대체되지 않는다.
+- **B의 함정**: firmware K-shift 커널이 없을 때 sched가 RoPE 노드를 CPU로 폴백시키려면 KV를 CPU로 읽어왔다 되써야 하므로 결국 D(get/set_tensor)가 필요하다. 즉 선택지는 "firmware 커널" 또는 "기능 비활성 + 재계산"이지 "CPU 대행"이 아니다. 비활성 경로가 안전하려면 `get_can_shift()`(iswa.cpp:221~224)가 false를 반환하게 해서 shift 요구 자체가 거부되게 해야 한다.
+- workaround 비용 = **트리거 빈도 x 그 시점 컨텍스트 길이의 prefill**. 짧은 대화/낮은 QPS면 무시 가능, 긴 컨텍스트의 잦은 넘침이나 SWA 깊은 rollback 빈발이면 체감이 크다.
+
+결론: **A등급(visible KV 계약)만 성립하면 correctness-complete한 서빙이 가능**하고, B/C/D 구현 순서는 정확성이 아니라 워크로드 프로파일(컨텍스트 길이, 넘침 빈도, SWA 사용 여부)로 정하면 된다.
+
+### dNPU 함의: 체크포인트는 D등급의 대표 소비자다
+
+14번 문서 매핑 표에서 -ctxcp가 D로 분류된 근거가 위 저장 경로 그 자체다:
+
+- **요구사항은 부분 DMA**: `write_tensor(k, range.first*k_size_row, buf_size)`처럼 항상 "셀 구간 x 행 크기"의 연속 조각 단위로 호출되므로, dNPU buft의 `get_tensor`/`set_tensor`가 **offset/size 부분 읽기·쓰기**를 지원해야 한다. 새 프로토콜이 아니라 표준 backend iface 2개의 충실한 구현이다.
+- **D가 없을 때**: SWA 모델에서 슬랙을 넘는 rollback의 복구가 항상 "전체 재처리"로 떨어진다. 정확성은 유지되고 성능만 손해 - 따라서 SWA 모델을 주력으로 쓸 계획이면 D의 우선순위를 앞당길 실익이 있다.
+- **트래픽 특성**: 생성/복원 시에만 MB급 버스트, steady-state decode 영향 0. 다만 speculative 경로의 체크포인트 생성(server-context.cpp:2509~)이 잦으면 버스트 빈도가 오르므로 `-ctxcp` 개수와 함께 튜닝 대상이다.
+- **우회로 - device 상주 스냅샷**: `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE`(llama.h:878~880)는 상태를 host로 꺼내지 않고 device 버퍼에 보관하는 모드다. dNPU로 옮기면 "체크포인트 = NPU DRAM 내부 blit 사본"이 되어 PCIe 왕복이 사라지고, 요구 능력이 D(DMA)가 아니라 C(`cpy_tensor` blit)에 가까워진다. C를 먼저 구현했다면 체크포인트를 device-측 스냅샷으로 앞당겨 켤 수 있다.
 
 정리하면 SWA는 "메모리 절감 <-> 시간 여행의 자유"를 교환하며, 그 균형점을 사용자가 고른다: 기본(창 크기 캐시 + 체크포인트) vs `--swa-full`(풀 캐시, 제약 없음).
 
@@ -492,6 +596,33 @@ std::vector<ggml_tensor *> s_l;   // 레이어별 ssm 상태
 
 이 표의 마지막 행이 hybrid 운영의 지배 요인이다: **전체 메모리의 rollback 능력은 가장 약한 구성원(recurrent)을 따른다.** 그래서 hybrid/recurrent 모델에서 서버는 SWA와 같은 체크포인트 메커니즘에 의존하고, speculative decoding도 체크포인트 경유로만 가능하다 (server-context.cpp:1046 "speculative decoding will use checkpoints").
 
+### SWA와 같은 원리인가: 재계산 폴백은 동일, 지렛대가 다르다
+
+5장의 원리들("memoization이라 재계산 폴백이 항상 존재", "체크포인트 + 전체 재처리 사다리")이 hybrid에도 성립하는지 항목별로 보면:
+
+**같은 것 - 안전망 전체.** recurrent 상태도 결정론적 forward의 산물이라 원본 토큰 열에서 재계산 가능하다. 서버는 SWA와 recurrent를 같은 안전망으로 묶는다 - 체크포인트 플래그가 `SWA_ONLY`에서 `PARTIAL_ONLY`로 일반화된 이유가 이것이고(llama.h:875 주석 "such as SWA KV cache **or recurrent cache (e.g. Mamba)**"), 폴백 로그도 "likely due to SWA **or hybrid/recurrent** memory"로 둘을 함께 부른다.
+
+**다른 것 1 - A등급 지렛대(mask)가 recurrent 쪽엔 없다.** "K/V 바이트는 두고 장부+mask로 보이기/숨기기만 조작"이 성립한 것은 **셀 축이 존재하기 때문**이었다. recurrent 상태는 토큰별 셀의 나열이 아니라 seq당 고정 크기 벡터 1개이고 매 스텝 제자리 덮어쓰기된다. 과거 토큰별 항목이 없으니 "특정 토큰만 가리기"라는 연산이 정의되지 않고, KQ_mask도 recurrent 레이어는 소비하지 않는다. 따라서 recurrent 쪽 seq 조작은 mask 트릭이 아니라 **실제 상태 데이터 조작**(copy = blit)이다.
+
+**다른 것 2 - rollback 완충이 훨씬 얇다 (그러나 0은 아니다).** SWA의 슬랙(~n_ubatch)에 대응하는 완충이 recurrent에도 있다: per-token 상태 스냅샷 링이다 (src/llama-memory-recurrent.cpp:181~189):
+
+```cpp
+// partial rollback via per-token snapshot index (bounded by n_rs_seq)
+const llama_pos rollback = cell.pos - (p0 - 1);
+if (rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
+    set_rs_idx(seq_id, (uint32_t) rollback);   // 링에 보관된 과거 상태로 인덱스만 되감기
+    cell.pos = p0 - 1;
+    return true;
+}
+return false;   // 링 깊이 초과 -> 서버의 체크포인트/전체 재처리 폴백으로
+```
+
+최근 n_rs_seq 토큰 안의 rollback은 인덱스 되감기로 처리되고(speculative의 몇 토큰 무르기가 여기 들어맞는다), 초과하면 `seq_rm`이 false를 반환해(170~174행 주석: "Mamba/RWKV는 시퀀스 끝을 부분 삭제할 수 없다") 5장의 폴백 사다리로 넘어간다. **구조는 SWA와 같고, 완충의 두께와 구현 방식(mask가 아닌 스냅샷 링)이 다르다.**
+
+**다른 것 3 - 공유의 단위.** attention은 셀 단위 부분 공유(prefix의 일부 구간)가 가능하지만, recurrent 상태는 "정확히 같은 전체 prefix"일 때만 상태 복사로 공유할 수 있다 - 부분 창 공유가 없다.
+
+**dNPU 관점의 수정.** "A만으로 correctness-complete"라는 5장의 명제는 hybrid에서 이렇게 조정된다: 기본 decode + 재계산 폴백만으로는 여전히 정확성이 완결되지만, mask 지렛대가 없으므로 seq_cp(-pps) 같은 A행 조작이 recurrent 쪽에서는 상태 텐서 복사(장치 작업)를 동반한다. 위안이 되는 점: recurrent 상태(r_l/s_l)는 작고 고정 크기라 save/restore DMA도 상태 복사 blit도 KV 대비 훨씬 저렴하다.
+
 ubatch 분할도 다르다 (13번 문서 1장의 분할 표): recurrent 상태는 "시퀀스당 하나"라서 한 ubatch 안에 같은 seq의 토큰들이 **연속으로 묶여** 있어야 한다 -> `split_equal`/`split_seq`가 강제되고 `split_simple`은 못 쓴다 (src/llama-memory-hybrid.cpp:77~86).
 
 ## 7. 세 구현의 기능 매트릭스
@@ -501,7 +632,7 @@ ubatch 분할도 다르다 (13번 문서 1장의 분할 표): recurrent 상태�
 | seq_rm rollback | 자유 | **창 안에서만** (밖은 체크포인트) | **불가** (체크포인트/n_rs_seq) |
 | seq_cp 공유 | 태그만 (0 복사) | 두 캐시 팬아웃 | attn 태그 + recurrent 상태 복사 |
 | K-shift (`seq_add`) | O | O (두 캐시) | attn만 의미 있음 |
-| session save/restore | O | O (SWA_ONLY 부분 저장 지원) | O (상태 포함) |
+| session save/restore | O | O (PARTIAL_ONLY 부분 저장 지원) | O (상태 포함) |
 | ubatch 분할 | split_simple | split_simple(unified) | **split_equal/seq 강제** |
 | 메모리 비용 | n_ctx 선형 | full층 선형 + SWA층 상수 | attn층 선형 + recr층 **상수** |
 
@@ -516,6 +647,6 @@ ubatch 분할도 다르다 (13번 문서 1장의 분할 표): recurrent 상태�
 1. **SWA/hybrid는 memory 구현 교체로 흡수된다** - context/그래프 빌더는 불변, `create_memory()` 팩토리가 아키텍처에 맞는 구현을 고른다.
 2. **iSWA = 표준 캐시 2개 + 레이어 필터**: SWA 캐시 크기는 `n_swa x n_seq + n_ubatch`(창+여유분)로, n_ctx와 무관하게 상수다.
 3. **SWA 만료는 lazy**: 프루닝 패스 없이 find_slot이 창 밖 셀을 빈 칸처럼 재사용한다(링 버퍼). purge 불변식이 "[pos_min, pos_max] 연속성"을 지킨다.
-4. **SWA의 대가는 rollback 제약**: 창 밖 과거는 물리적으로 사라지므로, 서버는 `-ctxcp` 체크포인트(SWA_ONLY 부분 스냅샷)로 보완한다. `--swa-full`은 메모리로 제약을 되사는 옵션이다.
+4. **SWA의 대가는 rollback 제약**: 안전한 rollback 깊이는 슬랙(~n_ubatch)뿐이고, 그 밖은 `-ctxcp` 체크포인트(PARTIAL_ONLY 부분 스냅샷, seq x SWA 캐시 단위) 복원 또는 전체 재처리로 폴백된다. `--swa-full`은 메모리로 제약을 되사는 옵션이다.
 5. **recurrent 상태는 "시퀀스당 고정 크기 1개"** - 토큰당 셀이라는 KV 모델과 근본이 다르고, 과거가 비가역 압축되므로 rollback이 원리적으로 불가하다. hybrid의 운영 능력은 이 가장 약한 고리를 따른다.
 6. **dNPU 관점**: host-visible KV 계약만 지키면 iSWA는 공짜, hybrid는 recurrent 상태 텐서에 대한 추가 계약(고정 크기 read-modify-write)이 필요하다.
