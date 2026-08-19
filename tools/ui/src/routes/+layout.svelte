@@ -26,18 +26,18 @@
 	import { modelsStore } from '$lib/stores/models.svelte';
 	import { mcpStore } from '$lib/stores/mcp.svelte';
 	import { TOOLTIP_DELAY_DURATION } from '$lib/constants';
-	import { IsMobile } from '$lib/hooks/is-mobile.svelte';
 	import { useKeyboardShortcuts } from '$lib/hooks/use-keyboard-shortcuts.svelte';
 	import { useSettingsNavigation } from '$lib/hooks/use-settings-navigation.svelte';
 	import { conversations } from '$lib/stores/conversations.svelte';
+	import { isMobile } from '$lib/stores/viewport.svelte';
 
 	let { children } = $props();
 	let alwaysShowSidebarOnDesktop = $derived(config().alwaysShowSidebarOnDesktop);
-	let isMobile = new IsMobile();
 	let isDesktop = $derived(!isMobile.current);
 	let sidebarOpen = $state(false);
 	let mounted = $state(false);
 	let innerHeight = $state<number | undefined>();
+	let innerWidth = $state(browser ? window.innerWidth : 0);
 
 	let chatSidebar:
 		| {
@@ -169,6 +169,14 @@
 		}
 	});
 
+	// Inject custom CSS at runtime through an action on the head style node
+	// textContent keeps the value as text, never parsed as HTML
+	function customCss(node: HTMLStyleElement) {
+		$effect(() => {
+			node.textContent = (config().customCss as string | undefined) ?? '';
+		});
+	}
+
 	// Fetch router models when in router mode (for status and modalities)
 	// Wait for models to be loaded first, run only once
 	let routerModelsFetched = false;
@@ -227,6 +235,12 @@
 	});
 </script>
 
+<svelte:head>
+	{#if config().customCss}
+		<style use:customCss></style>
+	{/if}
+</svelte:head>
+
 <Tooltip.Provider delayDuration={TOOLTIP_DELAY_DURATION}>
 	<ModeWatcher />
 	<Toaster richColors />
@@ -240,7 +254,7 @@
 	/>
 
 	<Sidebar.Provider bind:open={sidebarOpen}>
-		<div class="flex h-screen w-full" style:height="{innerHeight}px">
+		<div class="flex h-screen w-full">
 			<Sidebar.Root variant="floating" class="h-full"
 				><SidebarNavigation bind:this={chatSidebar} /></Sidebar.Root
 			>
@@ -278,4 +292,4 @@
 	</Sidebar.Provider>
 </Tooltip.Provider>
 
-<svelte:window onkeydown={handleKeydown} bind:innerHeight />
+<svelte:window onkeydown={handleKeydown} bind:innerHeight bind:innerWidth />

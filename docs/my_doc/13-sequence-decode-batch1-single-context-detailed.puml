@@ -1,0 +1,149 @@
+@startuml
+title 단일 컨텍스트 decode 상세 주석판: sequence 1개, batch size 1 (n_tokens = 1)
+
+participant App
+box "llama_context 소유물" #F0F8FF
+  participant "llama_context" as C
+  participant "batch_allocr" as BA
+  participant "llama_memory_i\n(KV cache)" as KV
+  participant "ggml_backend_sched" as S
+  participant "ggml_backend_t\n(CUDA0 stream)" as B
+end box
+participant "llama_model\n(weights)" as M
+
+note across
+  **예제 설정** (batch2 주석판의 단일 시퀀스 축소판 - 14번 문서 상태 전이 예제의 T2와 동일 상황)
+  |= 항목 |= 내용 |
+  | seq 0 | "what is capi tal of france ?" prefill 완료 (7토큰, pos 0..6) |
+  | 이번 스텝 | 직전에 샘플링된 토큰 1개를 decode\ntoken[0] = "Paris" (pos 7) |
+  | 모델 가정 (7B급) | n_embd=4096, n_layer=32, n_head=32, n_head_kv=8, d_head=128\nn_embd_k_gqa = n_embd_v_gqa = 8x128 = 1024, n_vocab=32000 |
+  | 설정 가정 | n_ctx=8192, kv_unified=true (n_stream=1), **n_seq_max=1**\nn_batch=2048, n_ubatch=512, KV 타입 F16 |
+end note
+
+note over App
+  **변수 용어 정리**
+  | 변수 | 의미 | 이 예제 값 |
+  | n_tokens | 이번 batch의 토큰 수 | **1** |
+  | n_outputs | logits를 뽑을 토큰 수 | **1** |
+  | n_kv | attention이 읽는 KV 창 폭 (패딩 포함) | 8 -> 패딩 |
+  | n_ubatch | 그래프 1회 실행 최대 폭 | 512 (1 <= 512, ubatch 1개) |
+end note
+
+note over KV
+  **사전 상태: KV 캐시** (unified, n_stream=1)
+  |= cell |= 소유 |= 내용 |
+  |<#E8F4FF> 0 .. 6 | seq 0 | "what is capi tal of france ?"의 K/V (pos 0..6) |
+  | 7 .. 8191 | - | 비어 있음 |
+  텐서 shape/크기/축 해석은 batch2 주석판
+  (13-sequence-decode-batch2-single-context-detailed.puml)과 동일 - 그쪽 노트 참고
+end note
+
+App -> C : llama_decode(batch{n_tokens=1})
+note right
+  **입력 llama_batch**:
+    token  = [id("Paris")]
+    pos    = [7]
+    seq_id = [[0]]
+    logits = [1]
+end note
+
+== 1. 배치 검증/변환 ==
+C -> BA : balloc->init(batch, vocab, memory, n_seq_max=1)
+note right
+  - pos 연속성 검사: seq 0의 seq_pos_max=6, 6+1=7 OK
+  - logits 플래그 집계 -> n_outputs_all = 1
+end note
+BA --> C : n_tokens_all=1, n_outputs_all=1
+C -> C : sched_reserve() -> no-op (이미 예약됨)
+C -> KV : memory_update(false) -> 할 일 없음
+
+== 2. ubatch 분할 + KV 슬롯 예약 ==
+C -> KV : memory->init_batch(balloc, n_ubatch=512)
+note right
+  split_simple: 1 <= 512 -> **ubatch 1개** {n_tokens=1}
+  find_slot: head(=7)부터 빈 셀 탐색 -> cell 7 배정 계획
+end note
+KV --> C : mctx (ubatch 1개 + 슬롯 계획)
+C -> C : output_reserve(1) -> buf_output에 1행 확보
+
+== 3. ubatch 처리 (1개이므로 루프 1회) ==
+C -> KV : mctx->apply()
+note right
+  장부: cell 7 <- {seq 0, pos 7} 태그, head = 8
+  n_kv = 사용 셀 8을 패딩한 값 (창 패딩 - 그래프 재사용을 위해
+  실사용량이 아니라 패딩 배수로 고정. batch2 주석판 참고)
+end note
+
+alt 그래프 재사용 (can_reuse: 생성 루프의 통상 경로)
+  C -> C : gf_res_prev 재사용, n_reused++
+  note right : 매 스텝 n_tokens=1이 반복되므로\n생성 루프 내내 이 경로 - 재빌드는\nn_kv 패딩 경계를 넘을 때만
+else 토폴로지 변경 (첫 스텝, prefill 직후 등)
+  C -> S : ggml_backend_sched_reset()
+  C -> M : build_graph(gparams)
+  M --> C : ggml_cgraph (1-token 폭, ~2000 노드)
+  C -> S : ggml_backend_sched_alloc_graph(gf)
+end
+
+C -> C : res->set_inputs(ubatch)
+note right
+  **입력 텐서** ([ne0, ne1] 표기):
+    inp_tokens  : I32 [1] = [id("Paris")]
+    inp_pos     : I32 [1] = [7]
+    inp_out_ids : I32 [1] = [0]
+    k_idxs      : I64 [1] = [7]   <- 셀 7에 기록
+    KQ_mask     : F32 [n_kv, 1(패딩)]
+      row(Paris): cell 0..7 = 0 (자기 seq의 과거 전부), 나머지 -inf
+      <- 단일 seq라 격리 상대가 없어 mask는 causal+패딩 차단만 수행
+end note
+
+C -> S : graph_compute(gf, **batched=false**)
+note right
+  batch2와의 차이: n_tokens=1이라 batched=false
+  -> n_threads_batch가 아닌 **n_threads** 사용
+end note
+S -> B : split별 비동기 실행
+note right
+  **텐서 shape 흐름 (폭 1)**:
+  tok_embd get_rows      -> [4096, 1]
+  레이어 l = 0..31:
+    Q = wq x cur         -> [4096, 1] -> [128, 32, 1]
+    K = wk x cur         -> [1024, 1] -> [128, 8, 1]
+    V = wv x cur         -> [1024, 1]
+    K,V를 cell 7에 기록(set_rows)
+    attention            -> scores [n_kv, 1, 32] -> out [4096, 1]
+    FFN                  -> [11008, 1] -> [4096, 1]
+  output_norm            -> [4096, 1]
+  get_rows([0])          -> [4096, 1]
+  lm_head                -> **t_logits [32000, 1]**
+
+  폭 1은 **memory-bound**: 가중치 1회 읽기를 토큰 1개만 쓰므로
+  배칭 효과가 전혀 없다 - 같은 가중치 읽기로 2토큰을 처리하는
+  batch2 대비 처리량 절반 (지연은 거의 동일)
+end note
+B -> M : 가중치 읽기 (mul_mat의 한쪽 입력)
+B -> KV : **K/V append**: 레이어마다 새 K/V를\ncell 7에 기록 (set_rows 노드)\n+ attention이 cell 0..7 읽기
+note over KV
+  KV update는 그래프 안의 노드다 (별도 host 호출 없음).
+  매 스텝 셀이 1개씩 누적: 사용 셀 7 -> 8, 다음 스텝 8 -> 9, ...
+  (32개 레이어 모두 같은 셀 번호에 기록)
+end note
+S --> C : GGML_STATUS_SUCCESS
+C -> C : tensor_get_async(t_logits)\n-> buf_output [1 x 32000] floats
+
+== 4. 결과 사용 ==
+C --> App : return 0
+App -> C : llama_get_logits_ith(0)
+note right : 첫 접근 시 synchronize()로\nasync 복사 완료 보장
+App -> App : 샘플링 -> "is" -> 다음 스텝도 n_tokens=1 배치
+
+note over App, M
+  **decode 종료 상태**:
+  |= cell |= 소유 |= 내용 |
+  |<#E8F4FF> 0 .. 6 | seq 0 | 프롬프트의 K/V (pos 0..6) |
+  |<#E8F4FF> 7 | seq 0 | "Paris"의 K/V (pos 7) <- 이번 스텝에 기록 |
+  | 8 .. 8191 | - | 비어 있음 |
+
+  다음 스텝은 batch{token=[is], pos=[8]} - cell 8에 기록되며 완전히 동일한 1스텝의 반복.
+  **시퀀스가 2개가 되면** 이 스텝이 batch2 주석판(n_tokens=2, KQ_mask의 seq 격리 추가)이 된다.
+end note
+@enduml

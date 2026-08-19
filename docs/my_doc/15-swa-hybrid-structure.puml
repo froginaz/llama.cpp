@@ -1,0 +1,77 @@
+@startuml
+title llama_memory_i 구현 3종: unified / iSWA / hybrid
+skinparam linetype ortho
+
+interface "llama_memory_i\n(init_batch, seq_*, state_*)" as MI
+
+package "표준 (12/13/14번 문서의 전제)" {
+  class "llama_kv_cache" as KV {
+    v_cells (장부)
+    layers[]: cache_k/v_l
+    셀 = 토큰 1개의 K/V
+    크기: n_ctx에 선형
+  }
+}
+
+package "SWA 모델 (Gemma 2/3, GPT-OSS ...)" {
+  class "llama_kv_cache_iswa" as ISWA {
+    seq 연산을 두 캐시에 팬아웃
+  }
+  class "kv_base : llama_kv_cache" as BASE {
+    full-attention 레이어
+    (filter: !is_swa(il))
+    size = kv_size
+  }
+  class "kv_swa : llama_kv_cache" as SWA {
+    SWA 레이어 (filter: is_swa(il))
+    size = n_swa x n_seq + n_ubatch
+    <- n_ctx 무관, 상수!
+    셀 만료 = lazy (링 버퍼처럼 재사용)
+  }
+}
+
+package "hybrid 모델 (Jamba, Qwen3-Next ...)" {
+  class "llama_memory_hybrid" as HYB {
+    이종 메모리의 합성
+  }
+  class "mem_attn : llama_kv_cache" as HKV {
+    attention 레이어 (filter_attn)
+  }
+  class "mem_recr : llama_memory_recurrent" as RECR {
+    recurrent 레이어 (filter_recr)
+    mem_cell = **시퀀스당** 상태 1개
+    r_l/s_l: 고정 크기 상태 텐서
+    rollback 원리적 불가
+  }
+}
+
+MI <|.. KV
+MI <|.. ISWA
+MI <|.. HYB
+
+ISWA *-- BASE
+ISWA *-- SWA
+HYB *-- HKV
+HYB *-- RECR
+
+note bottom of SWA
+  창 밖 셀은 지우지 않는다 -
+  find_slot이 is_masked_swa 판정으로
+  빈 칸처럼 재사용 (llama-kv-cache.cpp:983)
+  대가: 창 밖 rollback 불가
+  -> 서버 -ctxcp 체크포인트로 보완
+end note
+
+note bottom of RECR
+  과거가 상태에 비가역 압축됨.
+  ubatch는 split_equal/seq 강제
+  (같은 seq 토큰이 연속으로 묶여야 함)
+end note
+
+note as N1
+  공통점: 전부 llama_memory_i 뒤에 숨는다.
+  llama_context와 그래프 빌더(build_attn)는
+  어느 구현이 꽂혀 있는지 모른다 -
+  model.create_memory() 팩토리가 선택 (12번 문서)
+end note
+@enduml
