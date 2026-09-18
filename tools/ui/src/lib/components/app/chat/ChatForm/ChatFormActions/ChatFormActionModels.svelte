@@ -1,9 +1,14 @@
 <script lang="ts">
 	import { chatStore } from '$lib/stores/chat.svelte';
-	import { modelsStore, modelOptions, selectedModelId } from '$lib/stores/models.svelte';
+	import {
+		modelsStore,
+		modelOptions,
+		selectedModelId,
+		selectedModelName
+	} from '$lib/stores/models.svelte';
 	import { isRouterMode, serverError } from '$lib/stores/server.svelte';
 	import { ModelsSelectorDropdown, ModelsSelectorSheet } from '$lib/components/app';
-	import { IsMobile } from '$lib/hooks/is-mobile.svelte';
+	import { isMobile } from '$lib/stores/viewport.svelte';
 	import { activeMessages } from '$lib/stores/conversations.svelte';
 
 	interface Props {
@@ -39,7 +44,18 @@
 
 	let lastSyncedConversationModel: string | null = null;
 
-	let selectorModel = $derived(conversationModel ?? modelsStore.selectedModelName ?? null);
+	let selectorModel = $derived.by(() => {
+		const storeModel = selectedModelName();
+		if (storeModel && storeModel !== conversationModel) {
+			return storeModel;
+		}
+
+		if (conversationModel) {
+			return conversationModel;
+		}
+
+		return null;
+	});
 
 	$effect(() => {
 		if (conversationModel && conversationModel !== lastSyncedConversationModel) {
@@ -50,7 +66,6 @@
 				modelsStore.selectedModelName = null;
 				modelsStore.clearSelection();
 			}
-
 			lastSyncedConversationModel = conversationModel;
 		} else if (
 			isRouter &&
@@ -60,9 +75,7 @@
 			!conversationModel
 		) {
 			lastSyncedConversationModel = null;
-
 			const first = modelOptions().find((m) => modelsStore.loadedModelIds.includes(m.model));
-
 			if (first) modelsStore.selectModelById(first.id);
 		}
 	});
@@ -106,10 +119,14 @@
 	});
 
 	$effect(() => {
+		void modelPropsVersion;
+
 		hasAudioModality = activeModelId ? modelsStore.modelSupportsAudio(activeModelId) : false;
 	});
 
 	$effect(() => {
+		void modelPropsVersion;
+
 		hasVideoModality = activeModelId ? modelsStore.modelSupportsVideo(activeModelId) : false;
 	});
 
@@ -151,8 +168,6 @@
 
 	let selectorModelRef: ModelsSelectorDropdown | ModelsSelectorSheet | undefined =
 		$state(undefined);
-
-	let isMobile = new IsMobile();
 
 	export function open() {
 		selectorModelRef?.open();

@@ -1,0 +1,58 @@
+@startuml
+title host-visible KV: dNPU decode 1스텝 (batch 2, seq 0/1)
+
+participant App
+box "host (llama.cpp)" #F0F8FF
+  participant "llama_context" as C
+  participant "llama_memory_i\n(셀 장부, host)" as MEM
+  participant "ggml_backend_sched" as S
+end box
+box "NPU" #FFF7E0
+  participant "NPU backend\n(ggml-backend iface)" as B
+  participant "NPU firmware" as FW
+  participant "KV buffer\n(NPU buft, cache_k/v_l)" as KVB
+end box
+
+== 0. context 생성 시 1회 ==
+C -> KVB : KV 텐서 할당 (NPU buft)\ncache_k_l/v_l [1024, 8192, 1] x 32레이어
+C -> B : register_kv_region(il, k_base, v_base,\ncell_stride, n_cells, n_stream, dtype) x 32
+B -> FW : KV 디스크립터 테이블 전달
+note right of FW
+  GGML_MAX_SRC=10 제약 때문에
+  캐시 64개를 노드 src로 넘기지 않고
+  테이블로 1회 등록한다
+end note
+
+== 1. decode(batch{n_tokens=2}) ==
+App -> C : llama_decode(batch)
+C -> MEM : init_batch -> find_slot: 빈 셀 13,14 계획
+C -> MEM : mctx->apply() - cell 13<-{seq0,pos7},\ncell 14<-{seq1,pos6} 태그, 장부 갱신
+note right of MEM
+  셀 장부(seq_id/pos)는 host에만 있다.
+  firmware는 끝까지 seq_id를 모른다.
+end note
+C -> C : set_inputs: tokens, pos,\n**k_idxs=[13,14], v_idxs, KQ_mask[n_kv,2]**
+C -> S : graph_compute(gf)
+S -> B : CUSTOM 노드 실행
+B -> FW : forward(tokens, pos, k_idxs, v_idxs,\nn_kv, KQ_mask)
+FW -> KVB : 레이어마다 새 K/V를\ncell 13,14 행에 기록 (계약: 행 = 셀)
+FW -> KVB : 창 [0..n_kv) 읽기 + KQ_mask로 격리\n(seq0 토큰은 cell 7..12를 못 봄)
+FW --> B : logits [n_vocab, 2]
+B --> S : 완료
+S --> C : GGML_STATUS_SUCCESS
+C --> App : logits -> 샘플링 -> 다음 스텝
+
+== 2. 그래프 밖에서의 KV 접근 (이제 가능해진 것들) ==
+App -> C : llama_memory_seq_rm(seq0, 8, -1)\n(예: speculative 거부 토큰 rollback)
+C -> MEM : 장부에서만 제거 - **셀 데이터는 안 지움**
+note right of MEM
+  다음 스텝의 KQ_mask가 해당 셀을
+  자연히 제외한다 (mask-only 격리)
+end note
+App -> C : llama_state_seq_save_file(seq1)
+C -> KVB : get_tensor로 seq1의 셀들 읽기 -> 직렬화
+note over KVB
+  firmware는 forward 사이의 외부
+  읽기/쓰기(set/get_tensor)를 용인해야 한다
+end note
+@enduml

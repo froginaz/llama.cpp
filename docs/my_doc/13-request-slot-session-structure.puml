@@ -1,0 +1,54 @@
+@startuml
+title request / slot / session / sequence / context / model 의 관계
+skinparam linetype ortho
+
+package "HTTP 계층 (일시적)" {
+  class "request\n(POST /completion 1회)" as Req {
+    prompt
+    id_slot (선택: slot 지정)
+  }
+}
+
+package "llama-server 계층 (상주)" {
+  class "slot #i\n(작업 자리)" as Slot {
+    id = i
+    현재 작업 상태
+    샘플러, 프롬프트 캐시
+  }
+}
+
+package "llama 계층 (상주)" {
+  class "sequence (seq_id = i)\n= 대화 1개의 KV 스트림" as Seq {
+    pos 0,1,2,...
+    KV 캐시 영역
+  }
+  class "llama_context\n(실행 엔진, 서버에 1개)" as Ctx {
+    n_seq_max = 슬롯 수
+    KV 캐시 풀, sched, 버퍼
+  }
+  class "llama_model\n(가중치, 읽기 전용)" as Model
+}
+
+package "디스크" {
+  class "session file\n(상태 스냅샷)" as Sess
+}
+
+Req "N개\n(시간에 걸쳐)" --> "1" Slot : 일시 배정\n(idle 또는 prefix 유사 slot,\n-sps / id_slot)
+Slot "1" -- "1" Seq : 고정 매핑\nslot.id == seq_id
+Ctx *-- "n_seq_max" Seq : 수용
+Ctx ..> Model : const & (공유, 비소유)
+
+Ctx ..> Sess : 전체 상태 저장/복원\nllama_state_save_file\n(llama-cli --prompt-cache)
+Seq ..> Sess : slot 단위 저장/복원\nllama_state_seq_save_file\n(server --slot-save-path)
+
+note bottom of Req
+  request는 일감: 처리가 끝나면 사라짐.
+  slot/sequence는 남아서 다음 request를 기다림.
+end note
+
+note bottom of Sess
+  session은 살아있는 객체가 아니라
+  context(또는 sequence 하나) 상태의
+  직렬화된 파일이다.
+end note
+@enduml
