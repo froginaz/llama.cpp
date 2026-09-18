@@ -25,9 +25,18 @@ the verification order and pitfalls.
 
 ## Build and test
 
+CMake, same flow as llama.cpp on every platform (on Windows run these from
+a Visual Studio developer prompt / with MSVC, exactly as for llama.cpp):
+
 ```bash
-make test    # builds 3 assert-based test binaries and runs them
+cmake -B build
+cmake --build build --config Release
+ctest --test-dir build --build-config Release --output-on-failure
 ```
+
+On POSIX a plain `make test` also works (GNU make + g++). Note: the
+CMakeLists scrubs `NDEBUG` from Release flags on purpose - the tests are
+assert-based and would otherwise pass vacuously.
 
 Tests cover: small-scale ledger scenarios with failure injection and epoch
 fencing, 25K-token plans across `n_ubatch x trim_granularity` combinations,

@@ -199,8 +199,11 @@ need to know.
 
 ## 3. Verification order (do not reorder)
 
-1. **Host-only**: `make test` in this folder on your build machine. This is
-   the executable spec; if you change any semantics, change the tests first.
+1. **Host-only**: build and run the tests in this folder on your build
+   machine - `cmake -B build && cmake --build build --config Release &&
+   ctest --test-dir build --build-config Release` (or `make test` on
+   POSIX). This is the executable spec; if you change any semantics, change
+   the tests first.
 2. **Driver shim**: reimplement `FakeDev` against the real driver
    (`INpuKvBackend` + a `run_ubatch` that submits and waits). Re-run Test A
    at its tiny sizes. The one assertion you cannot keep is
