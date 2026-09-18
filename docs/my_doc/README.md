@@ -157,6 +157,7 @@ Walking the stages in execution order:
 - [14-host-visible-kv.md](14-host-visible-kv.md) — opening the llama.cpp KV cache to an external accelerator (dNPU): the stateful-node problem, KV as a mutable persistent leaf, the layout/invariant contract, before/after architecture, and the feature-unlock map (Korean), with PlantUML sources: [host-visible KV decode step](14-host-visible-kv-decode.puml), [PCIe split-memory dataflow](14-host-visible-kv-pcie.puml).
 - [15-swa-and-hybrid-kv.md](15-swa-and-hybrid-kv.md) — how the KV cache operates for sliding-window-attention and hybrid (attention + recurrent) models: the two-cache iSWA composition, lazy cell expiry, rollback limits and server checkpoints, the recurrent state model, and a feature matrix (Korean), with PlantUML source: [memory-implementation structure](15-swa-hybrid-structure.puml).
 - [microkv/](microkv/) — 초소형 KV 캐시 장부(ledger) 파이썬 모형. 14번 문서의 장부 개념을 ~150줄로 축소한 교육용 코드이자, unit-test 자동 생성 데모의 대상 프로젝트.
+- [npu-prompt-cache/](npu-prompt-cache/) — host-side prompt caching for a device-private (host non-visible) NPU KV-cache: `KvLedger` (LCP prefill planner with epoch fencing) + `BackendStreamTracker` (ordinal-free graph-time stream tracker), C++17, assert-based tests (`make test`).
 
 ---
 

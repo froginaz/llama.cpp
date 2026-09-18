@@ -1,0 +1,29 @@
+# npu-prompt-cache
+
+Host-side prompt (prefix) caching for an LLM inference stack whose KV-cache
+lives in NPU device-private memory (host non-visible). Two standalone C++17
+modules, no external dependencies:
+
+- `src/kv_prefix_cache.hpp/.cpp` - **KvLedger**: host mirror of device KV
+  state + LCP prefill planner. Design invariants I1..I5 (committed-only
+  accounting, epoch fencing for async completions, last-token re-eval,
+  granularity-aligned trim) are commented in the source.
+- `src/backend_stream_tracker.hpp` - **BackendStreamTracker**: graph-time,
+  ordinal-free ubatch stream tracker. Classifies each forward window by
+  absolute position only (NEW_TURN / CONTINUATION / REWIND / GAP) using two
+  watermarks per sequence (`cursor`, `valid_end`), and decides skip/compute
+  without knowing "ubatch #k of turn T".
+
+Workload target: agent frameworks that resend `system prompt + tool schemas
++ history` every turn, so prefix reuse dominates TTFT. Relates to the
+ledger/visible-KV material in [14-host-visible-kv.md](../14-host-visible-kv.md).
+
+## Build and test
+
+```bash
+make test    # builds 3 assert-based test binaries and runs them
+```
+
+Tests cover: small-scale ledger scenarios with failure injection and epoch
+fencing, 25K-token plans across `n_ubatch x trim_granularity` combinations,
+and stream-tracker skip accounting including decode steps and GAP handling.
