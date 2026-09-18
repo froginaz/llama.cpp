@@ -18,6 +18,11 @@ Workload target: agent frameworks that resend `system prompt + tool schemas
 + history` every turn, so prefix reuse dominates TTFT. Relates to the
 ledger/visible-KV material in [14-host-visible-kv.md](../14-host-visible-kv.md).
 
+**Integrating this into the NPU ggml-backend?** Start with
+[INTEGRATION.md](INTEGRATION.md) - it maps each module to its layer,
+lists the firmware/driver invariants (F1-F4, trim + epoch echo), and gives
+the verification order and pitfalls.
+
 ## Build and test
 
 ```bash
